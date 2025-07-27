@@ -2,100 +2,151 @@ import numpy as np
 import sympy as sp
 from scipy.linalg import expm
 from scipy.integrate import quad_vec, quad
+import control
 
 class Quadcopter:
     def __init__(self, h):
         self.n = 12
         self.m = 4
         self.h = h #ZOH sampling time
-        self.x0 = np.zeros(self.n)
+        self.x0 = np.array([0,0,0,
+                            0,0,0,
+                            0,0,0,
+                            -0.5,-0.5,0])
 
         # Assume full state measurement
-        self.output_indices = [0,1,2,3,4,5,6,7,8,9,10,11]
-        self.p = 12
-        self.C = np.eye(self.p)
+        self.output_indices = [0,1,2,9,10,11]
+        self.p = len(self.output_indices)
+        self.C = np.zeros((len(self.output_indices), self.n))
+        for i, idx in enumerate(self.output_indices):
+            self.C[i, idx] = 1.0
 
         self.name = f"Quadcopter_h={self.h}"
-
-        self.constant_ref = np.array([0])
-        self.Mx = np.array([[1],[0]])
-        self.x_r = self.Mx @ self.constant_ref
         
         self.labels = {
-            "x": [r"$\phi$", r"$\theta$", r"$\psi$", "$p$", "$q$", "$r$", "$u$", "$v$", "$w$", "$x_{B_0}$", "$y_{B_0}$", "$z_{B_0}$"],
-            "u": [r"$\Omega_1^2$", r"$\Omega_2^2$", r"$\Omega_3^2$", r"$\Omega_4^2$"],
+            "x": [r"$\Phi$ [rad]", r"$\Theta$ [rad]", r"$\Psi$ [rad]",
+                  "$p$ [rad/s]", "$q$ [rad/s]", "$r$ [rad/s]",
+                  "$u$ [m/s]", "$v$ [m/s]", "$w$ [m/s]",
+                  "$x_{B_0}$ [m]", "$y_{B_0}$ [m]", "$z_{B_0}$ [m]"],
+            "u": ["$u_1$", "$u_2$", "$u_3$", "$u_4$"],
         }
         self.labels["y"] = [self.labels["x"][i] for i in self.output_indices]
 
         # Properties
-        self.mass = 1
+        self.mass = 0.5 # [kg]
         self.Inertia = np.diag([0.006, 0.006, 0.0011])
         self.gravity = 9.82 #[m/s^2]
-        self.r = 0.15 # Distance from the center of the quadcopter to a propeller
+        self.r = 0.1 # Distance from the center of the quadcopter to a propeller
 
-        # Goal operating point, In S coordinates
-        self.xg = np.array([0,0,0,0,0,0,5,0,5])
-        self.ug = 1/4*self.mass*self.gravity*np.ones(4)
+        # Aerodynamic properties
+        self.b = 1.e-05  # Thrust coefficient [N/(rad/s)^2]
+        self.d = 3.5e-8  # Drag coefficient [Nm/(rad/s)^2]
+
+        self.act_mat = self.actuator_matrix(self.b, self.r, self.d)
+
+        # Stationary operating point
+        self.x_eq= np.array([0,0,0,
+                             0,0,0,
+                             0,0,0,
+                             0,0,0])
+
+        self.constant_ref = self.x_eq[self.output_indices]
+        self.Mx = np.zeros((self.n, self.p))
+        for i, idx in enumerate(self.output_indices):
+            self.Mx[idx, i] = 1.0
+        self.x_r = self.Mx @ self.constant_ref
+
+        self.max_thrust = self.gravity*self.mass/2
+        self.u_eq = self.gravity*self.mass/4/self.max_thrust*np.ones(self.m)
 
         # Input and output constraints
-        self.x_lower = np.array([-np.pi, -np.pi, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -10, -10, -10])
-        self.x_upper = np.array([np.pi, np.pi, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, 10, 10, 10])
+        self.x_lower = np.array([-np.pi/2, -np.pi/2, -100, -100, -100, -100, -100, -100, -100, -10, -10, -10])
+        self.x_upper = np.array([np.pi/2, np.pi/2, 100, 100, 100, 100, 100, 100, 100, 10, 10, 10])
         self.y_lower = np.array([self.x_lower[i] for i in self.output_indices])
         self.y_upper = np.array([self.x_upper[i] for i in self.output_indices])
-        self.u_lower = np.zeros(4)
-        self.max_thrust = self.gravity*self.mass/2
-        self.u_upper = self.max_thrust*np.ones(4)
+        self.u_lower = 0.0*np.ones(self.m)
+        self.u_upper = np.ones(self.m)
 
-        # Cost parameters for predictive control
-        self.Q = 100*np.eye(self.p)
-        self.R = 0.1*np.eye(self.m)
-        self.Q_N = 100*np.eye(self.p)
-    
-        # Aerodynamic properties
-        self.b = 1.e-05  # Thrust coefficient
-        self.d = 3.5e-8  # Drag coefficient
+        self.F = np.vstack((np.eye(self.p),-np.eye(self.p)))
+        self.f = np.hstack((self.y_upper, -self.y_lower))
 
-        # Linearized dynamics around the stationary reference point
+        self.G = np.vstack((np.eye(self.m), -np.eye(self.m)))
+        self.g = np.hstack((self.u_upper, -self.u_lower))
+
+        # np.cost parameters for predictive control
+        self.Q = np.eye(self.p)
+        self.Q[0,0] = 300 # Phi cost
+        self.Q[1,1] = 300 # Theta cost
+        self.Q[2,2] = 300 # Psi cost
+        self.Q[-1,-1] = 100 # z cost
+        self.Q[-2,-2] = 100 # y cost
+        self.Q[-3,-3] = 100 # x cost
+        self.R = 1*np.eye(self.m)
+
+        # Linearize dynamics around the stationary point
         self.linearize()
 
-    def dynamics(self, x, u_input):
+    def dynamics(self, x, u_input, symbolic=False):
         ''' 
         Nonlinear continuous-time dynamics of the quadcopter.
         
         Arguments:
             x (12x1 np.ndarray): State vector
-            u (4x1 np.ndarray): Input vector (squared propeller speeds)
+            u (4x1 np.ndarray): Normalized Input vector in range [0,1] 
         
         Returns:
             xdot (12x1 np.ndarray): Time derivative of the state vector
         '''
 
+        u_input = u_input * self.max_thrust # Scale input from 0-1 to thrust
+
         Phi, Theta, Psi, p, q, r, u, v, w, _, _, _ = x
         Ix, Iy, Iz = np.diag(self.Inertia)
-        ft, Tx, Ty, Tz = self.actuator_matrix(self.b, self.r, self.d) @ u_input
+        ft, Tx, Ty, Tz = self.act_mat @ u_input
         g = self.gravity
         m = self.mass
 
-        xdot = np.array([
-            p + q * sp.tan(Theta) * sp.sin(Phi) - r * sp.cos(Phi) * sp.sin(Theta),
-            q * sp.cos(Phi) + r * sp.sin(Phi),
-            -q * sp.sin(Phi) / sp.cos(Theta) + r * sp.cos(Phi) / sp.cos(Theta),
-            q * r * (Iy - Iz) / Ix + Tx / Ix,
-            p * r * (Iz - Ix) / Iy + Ty / Iy,
-            p * q * (Ix - Iy) / Iz + Tz / Iz,
-            r * v - q * w - g * sp.sin(Theta),
-            p * w - r * u + g * sp.sin(Phi) * sp.cos(Theta),
-            q * u - p * v + g * sp.cos(Theta) * sp.cos(Phi) - ft / m,
-            u * (sp.cos(Theta) * sp.cos(Psi)) + v * (sp.cos(Psi) * sp.sin(Phi) * sp.sin(Theta) - sp.cos(Phi) * sp.sin(Psi)) + w * (sp.cos(Phi) * sp.cos(Psi) * sp.sin(Theta) + sp.sin(Phi) * sp.sin(Psi)),
-            u * (sp.cos(Theta) * sp.sin(Psi)) + v * (sp.sin(Phi) * sp.sin(Psi) * sp.sin(Theta) + sp.cos(Phi) * sp.cos(Psi)) + w * (sp.cos(Phi) * sp.sin(Psi) * sp.sin(Theta) - sp.cos(Psi) * sp.sin(Phi)),
-            -u * sp.sin(Theta) + v * sp.cos(Theta) * sp.sin(Phi) + w * sp.cos(Phi) * sp.cos(Theta)
-        ])
+        if symbolic:
+            xdot = np.array([
+                p + q * sp.tan(Theta) * sp.sin(Phi) - r * sp.cos(Phi) * sp.sin(Theta),
+                q * sp.cos(Phi) + r * sp.sin(Phi),
+                -q * sp.sin(Phi) / sp.cos(Theta) + r * sp.cos(Phi) / sp.cos(Theta),
+                q * r * (Iy - Iz) / Ix + Tx / Ix,
+                p * r * (Iz - Ix) / Iy + Ty / Iy,
+                p * q * (Ix - Iy) / Iz + Tz / Iz,
+                r * v - q * w - g * sp.sin(Theta),
+                p * w - r * u + g * sp.sin(Phi) * sp.cos(Theta),
+                q * u - p * v + g * sp.cos(Theta) * sp.cos(Phi) - ft / m,
+                u * (sp.cos(Theta) * sp.cos(Psi)) + v * (sp.cos(Psi) * sp.sin(Phi) * sp.sin(Theta) - sp.cos(Phi) * sp.sin(Psi)) + w * (sp.cos(Phi) * sp.cos(Psi) * sp.sin(Theta) + sp.sin(Phi) * sp.sin(Psi)),
+                u * (sp.cos(Theta) * sp.sin(Psi)) + v * (sp.sin(Phi) * sp.sin(Psi) * sp.sin(Theta) + sp.cos(Phi) * sp.cos(Psi)) + w * (sp.cos(Phi) * sp.sin(Psi) * sp.sin(Theta) - sp.cos(Psi) * sp.sin(Phi)),
+                -u * sp.sin(Theta) + v * sp.cos(Theta) * sp.sin(Phi) + w * sp.cos(Phi) * sp.cos(Theta)
+            ])
+
+        else:
+            xdot = np.array([
+                p + q * np.tan(Theta) * np.sin(Phi) - r * np.cos(Phi) * np.sin(Theta),
+                q * np.cos(Phi) + r * np.sin(Phi),
+                -q * np.sin(Phi) / np.cos(Theta) + r * np.cos(Phi) / np.cos(Theta),
+                q * r * (Iy - Iz) / Ix + Tx / Ix,
+                p * r * (Iz - Ix) / Iy + Ty / Iy,
+                p * q * (Ix - Iy) / Iz + Tz / Iz,
+                r * v - q * w - g * np.sin(Theta),
+                p * w - r * u + g * np.sin(Phi) * np.cos(Theta),
+                q * u - p * v + g * np.cos(Theta) * np.cos(Phi) - ft / m,
+                u * (np.cos(Theta) * np.cos(Psi)) + v * (np.cos(Psi) * np.sin(Phi) * np.sin(Theta) - np.cos(Phi) * np.sin(Psi)) + w * (np.cos(Phi) * np.cos(Psi) * np.sin(Theta) + np.sin(Phi) * np.sin(Psi)),
+                u * (np.cos(Theta) * np.sin(Psi)) + v * (np.sin(Phi) * np.sin(Psi) * np.sin(Theta) + np.cos(Phi) * np.cos(Psi)) + w * (np.cos(Phi) * np.sin(Psi) * np.sin(Theta) - np.cos(Psi) * np.sin(Phi)),
+                -u * np.sin(Theta) + v * np.cos(Theta) * np.sin(Phi) + w * np.cos(Phi) * np.cos(Theta)
+            ])
 
         return xdot
         
     def discrete_dynamics(self, x, u, use_casadi=False): #Nonlinear discrete dynamics
         x_next = x + self.h * self.dynamics(x, u, use_casadi=use_casadi)
         return x_next
+
+    def linear_dynamics(self, x, u):
+        xdot = self.A @ (x - self.x_eq) + self.B @ (u - self.u_eq)
+        return xdot
 
     def measure_output(self, x):
         y = self.C @ x #measure position
@@ -106,13 +157,7 @@ class Quadcopter:
     
     def input_constraint(self, u):
         return self.G@u <= self.g
-    
-    def stage_cost(self, y, r, u):
-        return (y-r).T @ self.Q @ (y-r) + u.T @ self.R @ u
-        
-    def terminal_cost(self, y, r):
-        return (y-r).T @ self.Q_N @ (y-r)
-        
+            
     def linearize(self):
         ''' 
         Linearize the dynamics around the stationary reference point.
@@ -122,14 +167,14 @@ class Quadcopter:
 
         # Define symbolic variables
         Phi, Theta, Psi, p, q, r, u, v, w, x, y, z = sp.symbols('Phi Theta Psi p q r u v w x y z')
-        omgega1_sq, omgega2_sq, omgega3_sq, omgega4_sq = sp.symbols('omgega1_sq omgega2_sq omgega3_sq omgega4_sq')
+        u1, u2, u3, u4 = sp.symbols('u1 u2 u3 u4')
 
         # State and input vectors
         state_vec = sp.Matrix([Phi, Theta, Psi, p, q, r, u, v, w, x, y, z])
-        input_vec = sp.Matrix([omgega1_sq, omgega2_sq, omgega3_sq, omgega4_sq])
+        input_vec = sp.Matrix([u1, u2, u3, u4])
 
         # Define nonlinear equations
-        f = sp.Matrix(self.dynamics(state_vec, input_vec))
+        f = sp.Matrix(self.dynamics(state_vec, input_vec, symbolic=True))
 
         # Compute Jacobians
         A_sym = f.jacobian(state_vec)
@@ -139,10 +184,10 @@ class Quadcopter:
         stationary_values = {
             Phi: 0, Theta: 0, Psi: 0, p: 0, q: 0, r: 0,
             u: 0, v: 0, w: 0, x: 0, y: 0, z: 0,
-            omgega1_sq: self.gravity*self.mass/(4*self.b),
-            omgega2_sq: self.gravity*self.mass/(4*self.b),
-            omgega3_sq: self.gravity*self.mass/(4*self.b),
-            omgega4_sq: self.gravity*self.mass/(4*self.b),
+            u1: self.gravity*self.mass/4/self.max_thrust,
+            u2: self.gravity*self.mass/4/self.max_thrust,
+            u3: self.gravity*self.mass/4/self.max_thrust,
+            u4: self.gravity*self.mass/4/self.max_thrust,
         }
 
         # Evaluate the matrices at the equilibrium point
@@ -156,7 +201,7 @@ class Quadcopter:
         # ZOH discrete-time dynamics matrices
         self.Ad = expm(self.A*self.h)
         self.Bd, _ = quad_vec(lambda s: expm(self.A*s) @ self.B, 0, self.h)
-
+        
     def actuator_matrix(self, b, r, d):
         '''
         Generate the actuator matrix for the quadcopter, relating the squared propeller speeds to the thrust and torques.
@@ -171,14 +216,30 @@ class Quadcopter:
         '''
 
         A = np.array([
-            [b, b, b, b],
-            [(b*r/np.sqrt(2)), -(b*r/np.sqrt(2)), (b*r/np.sqrt(2)), -(b*r/np.sqrt(2))],
-            [(b*r/np.sqrt(2)), (b*r/np.sqrt(2)), -(b*r/np.sqrt(2)), -(b*r/np.sqrt(2))],
-            [d, -d, d, -d]
+            [1, 1, 1, 1],
+            [(r/np.sqrt(2)), -(r/np.sqrt(2)), -(r/np.sqrt(2)), (r/np.sqrt(2))],
+            [(r/np.sqrt(2)), (r/np.sqrt(2)), -(r/np.sqrt(2)), -(r/np.sqrt(2))],
+            [d/b, -d/b, d/b, -d/b]
         ])
 
         return A
+    
+    def B0_to_S(self, x_B0):
+        R = np.array([[-1, 0, 0],
+                      [0, 1, 0],
+                      [0, 0, -1]])
+        x_S = R @ x_B0
+        return x_S
+
+    def B_to_B0_matrix(self, phi, theta, psi):
+        R = np.array([[np.cos(theta)*np.cos(psi),   np.sin(phi)*np.sin(theta)*np.cos(psi) - np.cos(phi)*np.sin(psi),   np.cos(phi)*np.sin(theta)*np.cos(psi)+np.sin(phi)*np.sin(psi)],
+                      [np.cos(theta)*np.sin(psi),   np.sin(phi)*np.sin(theta)*np.sin(psi) + np.cos(phi)*np.cos(psi),   np.cos(phi)*np.sin(theta)*np.sin(psi)-np.sin(phi)*np.cos(psi)],
+                      [-np.sin(theta)        ,   np.sin(phi)*np.cos(theta)                             ,   np.cos(phi)*np.cos(theta)                           ]])
+        return R
 
 if __name__ == "__main__":
     h = 0.1
     quadcopter = Quadcopter(h)
+    print(quadcopter.Ad)
+    print(quadcopter.Bd)
+    L, P, E = control.dlqr(quadcopter.Ad, quadcopter.Bd, quadcopter.Q, quadcopter.R)

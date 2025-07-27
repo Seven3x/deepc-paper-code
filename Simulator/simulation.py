@@ -8,7 +8,7 @@ class Simulation:
     A simulation class that integrates a given system's dynamics and applies a controller.
     """
     
-    def __init__(self, system, controller, dt=0.01, t_final=10):
+    def __init__(self, system, controller, dt=0.001, t_final=10):
         """
         Initializes the simulation.
         
@@ -87,9 +87,7 @@ class Simulation:
                 y_data.append(y)
                 k += 1
 
-                print(f"input calculated at time: {t}")
-                print(f"y: {y}")
-                print(f"u: {u}")
+                print(f"Time: {t:.2f}s, Input: {u}, Output: {y}")
 
             x = self.rk4(x, u)                 # Integrate system dynamics
             # Store data
@@ -115,14 +113,14 @@ class SimulationPlotter:
         self.name = system.name
         self.labels = system.labels
 
-    def plot(self, result, ref, start_plotting_from=0):
+    def plot(self, result, ref):
         """Plot the simulation data."""
         # Extracting the data from result dictionary
         self.time = result["time"]
-        self.discrete_time = result["discrete time"][start_plotting_from:]
+        self.discrete_time = result["discrete time"]
         self.x_data = result["x"]
-        self.u_data = result["u"][:,start_plotting_from:]
-        self.y_data = result["y"][:,start_plotting_from:]
+        self.u_data = result["u"]
+        self.y_data = result["y"]
 
         # Number of states, inputs, and outputs
         n = self.x_data.shape[0]
@@ -131,12 +129,12 @@ class SimulationPlotter:
 
         total_discrete_data_points = result["y"].shape[1]
 
-        self.ref = ref
+        self.traj = None
 
         if ref is not None:
             # Extend the reference trajectory to the total number of discrete data points
-            self.ref = ref.extend_reference(ref.output_reference, total_discrete_data_points)
-            self.ref = self.ref[:,start_plotting_from:]
+            self.traj = ref.extend_reference(ref.output_reference, total_discrete_data_points)
+            self.traj = self.traj[:,:total_discrete_data_points]
 
         # Plotting states (x_data) over time
         self._plot_subplots(self.x_data, n, self.labels["x"], 'State Evolution', self.time, 'blue')
@@ -160,16 +158,15 @@ class SimulationPlotter:
                 plt.step(x_data, data[i, :], color=color)
             else:
                 plt.plot(x_data, data[i, :], color=color)
-                if title == 'Output Evolution' and self.ref is not None:
-                    self.ref
-                    plt.plot(x_data, self.ref[i,:], color = 'black', label='Reference')
+                if title == 'Output Evolution' and self.traj is not None:
+                    plt.plot(x_data, self.traj[i,:], color = 'black', label='Reference')
+                    plt.legend()
             plt.ylabel(labels[i])
             plt.xlabel('Time [s]')
-            plt.legend()
             plt.grid(True)  # Add grid to each subplot
 
         plt.suptitle(title)
         plt.tight_layout()  # Adjust layout to avoid overlapping elements
         plt.subplots_adjust(top=0.9)  # Adjust the top margin for the suptitle
         
-        plt.savefig(f"masterthesis/Python/Figures/{self.name}_{title}.png")
+        plt.savefig(f"DeePC_Quadcopter/Plots/{self.name}_{title}.png")

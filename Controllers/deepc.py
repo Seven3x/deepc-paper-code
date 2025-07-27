@@ -5,51 +5,61 @@ import mosek
 
 class DeePC:
     
-    def __init__(self, system, trajectory, initial_controller, hankel_update_interval = np.inf):
+    def __init__(self, system, trajectory, initial_controller, is_regularized=True):
         '''Initialize DeePC controller'''
 
-        self.N = 10 # Prediction horizon
-        self.N_u = 1 # Input horizon
+        self.N = 25 # Prediction horizon
         
         self.system = system
         self.n = system.n
         self.m = system.m
         self.p = system.p
 
-        self.trajectory = trajectory
-        self.remaining_output_reference = self.trajectory.extend_reference(trajectory.output_reference, self.N)
-
         self.initial_controller = initial_controller
+        self.data_is_persistently_exciting = False
 
-        self.T_ini = 2 # >= l(B) (how many past datapoints we need for indirect initial state estimation)
-        self.T = (self.m+1)*(self.T_ini+self.N+self.n-1) + 1
+        self.T_ini = 6 # >= l(B) (how many past datapoints we need for indirect initial state estimation, consider observability matrix)
+        self.T = (self.T_ini + self.N)*(1+self.m+self.p) - 1
+        self.T += 0
+
+        self.trajectory = trajectory
+        if self.trajectory.has_initial_ref:
+            self.trajectory.output_reference = np.hstack((self.trajectory.initial_reference(self.T),
+                                                        self.trajectory.output_reference))
+        self.remaining_output_reference = self.trajectory.extend_reference(self.trajectory.output_reference, self.N)
 
         # Set up QP optimization
         self.y_ini = cp.Parameter((self.p, self.T_ini))
         self.u_ini = cp.Parameter((self.m, self.T_ini))
         self.y_ini.value = np.zeros((self.p, self.T_ini))
         self.u_ini.value = np.zeros((self.m, self.T_ini))
-        self.U_p = cp.Parameter((self.T_ini, self.T - self.T_ini - self.N + 1))
-        self.Y_p = cp.Parameter((self.T_ini, self.T - self.T_ini - self.N + 1))
-        self.U_f = cp.Parameter((self.N, self.T - self.T_ini - self.N + 1))
-        self.Y_f = cp.Parameter((self.N, self.T - self.T_ini - self.N + 1))
-    
+        self.U_p = cp.Parameter((self.T_ini*self.m, self.T - self.T_ini - self.N + 1))
+        self.Y_p = cp.Parameter((self.T_ini*self.p, self.T - self.T_ini - self.N + 1))
+        self.U_f = cp.Parameter((self.N*self.m, self.T - self.T_ini - self.N + 1))
+        self.Y_f = cp.Parameter((self.N*self.p, self.T - self.T_ini - self.N + 1))
         self.ref = cp.Parameter((self.p, self.N))
         self.ref.value = self.remaining_output_reference[:,:self.N]
+        self.g_r = cp.Parameter((self.T - self.T_ini - self.N + 1, 1))
 
         self.y = cp.Variable((self.p, self.N))
         self.u = cp.Variable((self.m, self.N))
         self.g = cp.Variable((self.T - self.T_ini - self.N + 1, 1))
  
         # Slack variable and cost parameters
-        self.sigma_y = cp.Variable((self.p, self.T_ini))
-        self.lambda_y = 10e4
-        self.lambda_g = 300
+        self.is_regularized = is_regularized
+        if is_regularized:
+            self.sigma_y = cp.Variable((self.p, self.T_ini))
+            self.lambda_y = 10e3
+            self.lambda_g = 30
 
         self.con = self.setup_constraints()
         self.cost = self.setup_cost()
 
         self.problem = cp.Problem(cp.Minimize(self.cost), self.con)
+
+        # Empty data arrays
+        self.u_d = []
+        self.y_d = []
 
     def construct_hankel_matrix(self, x, L):
         '''
@@ -75,32 +85,39 @@ class DeePC:
         return H
     
     def create_and_partition_hankel_matrices(self):
-        # Create Hankel matrices and partition them
         U_d = self.construct_hankel_matrix(self.u_d, self.T_ini + self.N)
         Y_d = self.construct_hankel_matrix(self.y_d, self.T_ini + self.N)
 
-        self.U_p.value = U_d[:self.T_ini,:]
-        self.U_f.value = U_d[self.T_ini:,:]
-        self.Y_p.value = Y_d[:self.T_ini,:]
-        self.Y_f.value = Y_d[self.T_ini:,:]
+        self.U_p.value = U_d[:self.m*self.T_ini,:]
+        self.U_f.value = U_d[self.m*self.T_ini:,:]
+        self.Y_p.value = Y_d[:self.p*self.T_ini,:]
+        self.Y_f.value = Y_d[self.p*self.T_ini:,:]
+
+        self.Hpinv = np.linalg.pinv(np.vstack((self.U_p.value, self.Y_p.value, self.U_f.value, self.Y_f.value)))
+
+        print("Hankel matrices created and partitioned.")
 
     def setup_constraints(self):
         # Equality constraint
         u_ini = np.reshape(self.u_ini, (self.m*self.T_ini, 1), order='F')
         y_ini = np.reshape(self.y_ini, (self.p*self.T_ini, 1), order='F')
-        sigma_y = np.reshape(self.sigma_y, (self.p*self.T_ini, 1), order='F')
         u = np.reshape(self.u, (self.m*self.N, 1), order='F')
         y = np.reshape(self.y, (self.p*self.N, 1), order='F')
 
+        if self.is_regularized:
+            sigma_y = np.reshape(self.sigma_y, (self.p*self.T_ini, 1), order='F')
+        
         eq_con = [self.U_p @ self.g == u_ini]
-        eq_con += [self.Y_p @ self.g == y_ini + sigma_y]
+        eq_con += [self.Y_p @ self.g == y_ini + (sigma_y if self.is_regularized else 0)]
         eq_con += [self.U_f @ self.g == u]
         eq_con += [self.Y_f @ self.g == y]
             
         # Predicted Ouput and Input Constraint
         ineq_con = []
-        ineq_con += [self.system.output_constraint(self.y)]
-        ineq_con += [self.system.input_constraint(self.u)]
+        
+        for k in range(self.N):
+            ineq_con += [self.system.output_constraint(self.y[:,k])]
+            ineq_con += [self.system.input_constraint(self.u[:,k])]
 
         con = eq_con + ineq_con
 
@@ -108,50 +125,62 @@ class DeePC:
 
     def setup_cost(self):
         cost = 0
-        for k in range(self.N-1):
-            cost += cp.quad_form(self.y[:,k]-self.ref[:,k], self.system.Q) + cp.quad_form(self.u[:,k], self.system.R)
-        cost += self.lambda_g*cp.norm1(self.g) + self.lambda_y*cp.norm1(self.sigma_y)
+        for k in range(self.N):
+            cost += cp.quad_form(self.y[:,k]-self.ref[:,k], self.system.Q) + cp.quad_form(self.u[:,k]-self.system.u_eq, self.system.R)
+    
+        if self.is_regularized:
+            cost += self.lambda_g*cp.norm2(self.g-self.g_r) + self.lambda_y*cp.norm2(self.sigma_y)
 
         return cost
 
     def compute_input(self, x_current):
         y_current = self.system.measure_output(x_current)
 
-        if self.initial_phase_complete():
+        if self.data_is_persistently_exciting:
             u_optimal = self.compute_optimal_control()
         else:
-            u_optimal = self.initial_controller.compute_input(x_current)
-
+            u_optimal = self.initial_controller.compute_input(x_current, self.ref.value[:,0])
+            
         self.collect_and_update(y_current, u_optimal)
 
         return u_optimal
     
     def compute_optimal_control(self):
-    
-        self.problem.solve(solver=mosek, verbose=False)
+        self.problem.solve(verbose=False)
         u_optimal = self.u[:, 0].value
 
         return u_optimal
 
     def collect_and_update(self, y_current, u_optimal):
+
         self.y_ini.value[:,:-1] = self.y_ini.value[:,1:]
         self.u_ini.value[:,:-1] = self.u_ini.value[:,1:]
 
         self.y_ini.value[:,-1] = y_current
         self.u_ini.value[:,-1] = u_optimal
 
-        if not self.finished_collecting:
-            if self.T == self.u_d.shape[1]:
-                self.finished_collecting = True
-            else:
-                self.u_d = np.hstack([self.u_d, u_optimal.reshape(-1,1)])
-                self.y_d = np.hstack([self.y_d, y_current.reshape(-1,1)])
-            
         # Update the reference trajectory.
         self.shift_reference()
 
-    def initial_phase_complete(self):
-        return self.finished_collecting and self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
+        if not self.data_is_persistently_exciting:
+            self.u_d.append(u_optimal)
+            self.y_d.append(y_current)
+
+            if len(self.u_d) == self.T:
+                self.u_d = np.array(self.u_d).T
+                self.y_d = np.array(self.y_d).T
+                self.create_and_partition_hankel_matrices()
+                self.data_is_persistently_exciting = self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
+        
+        if self.data_is_persistently_exciting:
+            # Update steady state solution g_r 
+            uy_r = np.hstack((np.tile(self.system.u_eq, self.T_ini),
+                            np.tile(self.ref.value[:,0], self.T_ini),
+                            np.tile(self.system.u_eq, self.N),
+                            np.tile(self.ref.value[:,0], self.N),
+                            )).reshape(-1, 1)
+            
+            self.g_r.value = self.Hpinv @ uy_r
 
     def shift_reference(self):
         self.remaining_output_reference = self.trajectory.extend_reference(self.remaining_output_reference[:,1:], self.N)
@@ -159,4 +188,9 @@ class DeePC:
         
     def is_persistently_excited_of_order_L(self, x, L):
         H = self.construct_hankel_matrix(x, L)
-        return np.linalg.matrix_rank(H) == L
+        
+        if np.linalg.matrix_rank(H) == L*self.m:
+            print(f"Data is persistently exciting of order {L}!")
+            return True
+        else:
+            raise ValueError(f"Data is not persistently exciting, increase the amount of datapoints used in Hankelmatrix.")

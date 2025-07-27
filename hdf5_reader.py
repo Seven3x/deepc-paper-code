@@ -15,24 +15,25 @@ class HDF5Reader:
     def list_files_in_directory(self):
         return [f for f in os.listdir(self.directory) if os.path.isfile(os.path.join(self.directory, f))]
 
-    def choose_file(self, files, data_type):
+    def choose_file(self, files):
         print("-------------------------------------")
         for i, file in enumerate(files):
             print(f"{i + 1}: {file}")
-        choice = int(input(f"{data_type} - Enter the number of the file you want to choose: ")) - 1
+        choice = int(input(f"Enter the number of the file you want to choose: ")) - 1
         print("-------------------------------------")
         return files[choice]
 
-    def run(self, data_type):
+    def run(self):
         files = self.list_files_in_directory()
-        chosen_file = self.choose_file(files, data_type)
+        chosen_file = self.choose_file(files)
         file_path = os.path.join(self.directory, chosen_file)
         data = self.read_hdf5_file(file_path)
-        chosen_file = chosen_file.strip(".hdf5")
+        chosen_file = chosen_file.replace(".hdf5", "")
         return data, chosen_file
     
     def save_to_hdf5(self, data, filename):
-        with h5py.File(filename, 'w') as f:
+        name = f"{self.directory}/{filename}.hdf5"
+        with h5py.File(name, 'w') as f:
             for key, value in data.items():
                 # Check if the value is a numpy ndarray
                 if isinstance(value, np.ndarray):
