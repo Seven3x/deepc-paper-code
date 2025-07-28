@@ -12,7 +12,7 @@ class Quadcopter:
         self.x0 = np.array([0,0,0,
                             0,0,0,
                             0,0,0,
-                            -0.5,-0.5,0])
+                            0,0,0]) # Initial state vector
 
         # Assume full state measurement
         self.output_indices = [0,1,2,9,10,11]
@@ -75,12 +75,12 @@ class Quadcopter:
 
         # np.cost parameters for predictive control
         self.Q = np.eye(self.p)
-        self.Q[0,0] = 300 # Phi cost
-        self.Q[1,1] = 300 # Theta cost
-        self.Q[2,2] = 300 # Psi cost
+        self.Q[0,0] = 1 # Phi cost
+        self.Q[1,1] = 1 # Theta cost
+        self.Q[2,2] = 1 # Psi cost
         self.Q[-1,-1] = 100 # z cost
-        self.Q[-2,-2] = 100 # y cost
-        self.Q[-3,-3] = 100 # x cost
+        self.Q[-2,-2] = 200 # y cost
+        self.Q[-3,-3] = 200 # x cost
         self.R = 1*np.eye(self.m)
 
         # Linearize dynamics around the stationary point

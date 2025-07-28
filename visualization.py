@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, writers
-from mpl_toolkits.mplot3d import Axes3D  # ensures 3D projection works
+from mpl_toolkits.mplot3d import Axes3D  # ensures 3D proection works
 from quadcopter import Quadcopter
 
 def set_data(obj, start=None, end=None, x_list=None, y_list=None, z_list=None):

@@ -8,7 +8,7 @@ from hdf5_reader import HDF5Reader
 from visualization import QuadcopterAnimator
 
 h = 0.1 # Sampling time
-reference_duration = 13
+reference_duration = 30
 
 system = Quadcopter(h=h)
 reader = HDF5Reader("DeePC_Quadcopter/Results")
@@ -26,7 +26,7 @@ while running:
 
     elif a == 's':
         # sort = 'figure8', 'constant', 'step', 'box'
-        trajectory = TrajectoryGenerator(sort="step",
+        trajectory = TrajectoryGenerator(sort="figure8",
                                         system=system,
                                         duration=reference_duration,
                                         has_initial_ref=True)

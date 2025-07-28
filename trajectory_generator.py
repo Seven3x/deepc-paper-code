@@ -40,7 +40,7 @@ class TrajectoryGenerator:
         z_step = -1
         ref[:,ref_indieces] = np.vstack((np.zeros((self.system.p-3,len(t_ref))),
                         np.array([a*np.sin(2 * np.pi * frequency * t_ref),
-                        a/3*np.sin(4 * np.pi * frequency * t), z_step*np.ones(len(t_ref))])))
+                        a/3*np.sin(4 * np.pi * frequency * t_ref), z_step*np.ones(len(t_ref))])))
         
         return ref
     
@@ -105,7 +105,7 @@ class TrajectoryGenerator:
     
     def initial_reference(self, length):
         '''
-        Generate an initial reference trajectory to help excite the system
+        Generate an initial reference trajectory to help excite the system.
         
         Arguments:
             length (int): Length of the reference trajectory.
