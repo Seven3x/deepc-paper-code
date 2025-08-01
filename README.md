@@ -1,7 +1,7 @@
 # DeePC Quadcopter
 This project investigates the use of regularized Data-Enabled Predictive Control (DeePC) for controlling a quadcopter.
 
-DeePC is a data-driven control method, originally formulated for linear systems by Coulson, Lygeros, and Dörfler in [1]. The authors also propose a regularized version to better handle potential nonlinearities and measurement noise. Building on this, Elokda, Coulson, Beuchat, Lygeros, and Dörfler conducted a field study applying the method on a quadcopter, offering valuable insights into the selection of hyperparameters [2].
+DeePC is a data-driven control method, originally formulated by Coulson, Lygeros, and Dörfler in [1]. Although the presented theory requires the system to be linear, the authors also propose a regularized version to better handle potential nonlinearities and measurement noise. Building on this extension, Elokda, Coulson, Beuchat, Lygeros, and Dörfler applied the method on a quadcopter, offering valuable insights into the selection of hyperparameters [2].
 
 This project aims to provide additional insights into the application of DeePC to quadcopters and further validate the approach.
 
