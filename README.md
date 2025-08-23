@@ -1,13 +1,13 @@
 # DeePC Quadcopter
 This project investigates the use of regularized Data-Enabled Predictive Control (DeePC) for controlling a quadcopter.
 
-DeePC is a data-driven control method, originally formulated by Coulson, Lygeros, and Dörfler in [1]. Although the presented theory requires the system to be linear, the authors also propose a regularized version to better handle potential nonlinearities and measurement noise. Building on this extension, Elokda, Coulson, Beuchat, Lygeros, and Dörfler applied the method on a quadcopter, offering valuable insights into the selection of hyperparameters [2].
+DeePC is a data-driven control method, originally formulated by Coulson, Lygeros, and Dörfler in [1]. Although the presented theory requires the system to be linear, the authors also propose a regularized version to better handle potential nonlinearities and measurement noise. Building on this extension, Elokda, Coulson, Beuchat, Lygeros, and Dörfler apply the method on a quadcopter, offering valuable insights into the selection of hyperparameters [2].
 
 This project aims to provide additional insights into the application of DeePC to quadcopters and further validate the approach.
 
 ![Quadcopter Figure 8 Flight](Movies/deepc_quadcopter_figure8.gif)
 
-The flight can clearly be divided into two parts:
+The flight is divided into two parts:
   - **Data collection** - A standard LQR controller with added white noise excites the system.
   - **Reference tracking** – Given persistently exciting input data, the DeePC algorithm controls the system to follow a desired reference trajectory.
 
@@ -60,9 +60,9 @@ Animation saved as deepc_quadcopter_figure8_example.mp4 in DeePC_Quadcopter/Movi
 Animate result, simulate or exit (a/s/e): e
 ```
 ## Key insights
-[2] utilizes an inner control loop to regulate the yaw of the quadcopter, effectively keeping it "straight." This allows the linearized dynamics to approximate the real system well for small orientation angles, enabling DeePC to focus on controlling the position of the quadcopter without needing to learn the influence of the motors on yaw orientation. In contrast, this work includes both the quadcopter’s orientation (Φ, Θ, Ψ) and position (X, Y, Z) as outputs since no inner controller is used. As a result, DeePC is also responsible for regulating the yaw in this setup. If yaw is not explicitly regulated, the quadcopter tends to drift, causing the body frame to gradually misalign with the inertial frame. Once this deviation becomes too large, the system may become unstable. This misalignment is problematic because DeePC relies on data that is closely aligned with the inertial frame. Alternative adaptive DeePC techniques could be explored to address the issues of the drift, but that lies outside the scope of this project.
+[2] utilizes an inner control loop to regulate the yaw of the quadcopter, effectively keeping it "straight." This allows the linearized dynamics to approximate the real system well for small orientation angles, enabling DeePC to focus on controlling the position of the quadcopter without needing to learn the influence of the motors on yaw orientation. In contrast, this work includes both the quadcopter’s orientation (Φ, Θ, Ψ) and position (X, Y, Z) as outputs since no inner controller is used. As a result, DeePC is also responsible for regulating the yaw in this setup. If yaw is not explicitly regulated, the quadcopter tends to drift, causing the body frame to gradually misalign with the inertial frame. Once this deviation becomes too large, the system becomes unstable as DeePC relies on data that is closely aligned with the inertial frame. Alternative adaptive DeePC techniques could be explored to address the issues of the drift, but that lies outside the scope of this project.
 
-The following points were key to achieving satisfactory results:
+The following points are key to achieving satisfactory results:
   - It is important to penalize **u - u<sub>r</sub>** in the cost function, rather than just **u**, where **u<sub>r</sub>** is the steady-state control input.
   - **T<sub>ini</sub>** should be chosen as small as possible without compromising performance.
   - Regularization is essential for handling nonlinear dynamics.
