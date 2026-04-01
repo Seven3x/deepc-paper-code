@@ -3,6 +3,7 @@ import numpy as np
 from matplotlib.animation import FuncAnimation, writers
 from mpl_toolkits.mplot3d import Axes3D  # ensures 3D proection works
 from quadcopter import Quadcopter
+from paths import MOVIES_DIR, ensure_output_dirs
 
 def set_data(obj, start=None, end=None, x_list=None, y_list=None, z_list=None):
 
@@ -120,6 +121,7 @@ class QuadcopterAnimator:
         return artist_list
     
     def animate(self, data, output_filename="deepc_quadcopter_animation.mp4", fps=30):
+        ensure_output_dirs()
         self.time = data["time"]
         self.x = data["x"]  # State
 
@@ -147,6 +149,6 @@ class QuadcopterAnimator:
         writer = Writer(fps=fps, metadata={'artist': 'Me'}, bitrate=1800)
 
         # Save the animation as an MP4 file
-        ani.save(f"DeePC_Quadcopter/Movies/{output_filename}", writer=writer)
+        ani.save(MOVIES_DIR / output_filename, writer=writer)
 
-        print(f"Animation saved as {output_filename} in DeePC_Quadcopter/Movies")
+        print(f"Animation saved as {output_filename} in {MOVIES_DIR}")

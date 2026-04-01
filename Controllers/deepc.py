@@ -1,7 +1,6 @@
 import numpy as np
 import cvxpy as cp
 from hdf5_reader import HDF5Reader
-import mosek
 
 class DeePC:
     

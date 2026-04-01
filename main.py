@@ -6,12 +6,14 @@ from Simulator.simulation import Simulation, SimulationPlotter
 from trajectory_generator import TrajectoryGenerator
 from hdf5_reader import HDF5Reader
 from visualization import QuadcopterAnimator
+from paths import RESULTS_DIR, ensure_output_dirs
 
 h = 0.1 # Sampling time
 reference_duration = 30
 
 system = Quadcopter(h=h)
-reader = HDF5Reader("DeePC_Quadcopter/Results")
+ensure_output_dirs()
+reader = HDF5Reader(str(RESULTS_DIR))
 
 running = True
 

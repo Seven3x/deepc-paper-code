@@ -137,6 +137,9 @@ class TrajectoryGenerator:
             ref_extended (numpy.ndarray): Matrix of shape (m, N).
         """
         m, n = ref.shape  # Get current shape of A
+
+        if n == 0:
+            return np.tile(self.output_reference[:, -1].reshape(m, 1), (1, N))
         
         if n >= N:
             return ref  # If A already has N or more columns, return as is

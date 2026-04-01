@@ -33,6 +33,7 @@ class HDF5Reader:
     
     def save_to_hdf5(self, data, filename):
         name = f"{self.directory}/{filename}.hdf5"
+        os.makedirs(self.directory, exist_ok=True)
         with h5py.File(name, 'w') as f:
             for key, value in data.items():
                 # Check if the value is a numpy ndarray

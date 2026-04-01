@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 from scipy.linalg import expm
 from scipy.integrate import quad_vec, quad
 
+from paths import PLOTS_DIR, ensure_output_dirs
+
 class Simulation:
     """
     A simulation class that integrates a given system's dynamics and applies a controller.
@@ -147,6 +149,7 @@ class SimulationPlotter:
 
     def _plot_subplots(self, data, num_plots, labels, title, x_data, color, stairs=False):
         """Helper function to plot subplots in a grid."""
+        ensure_output_dirs()
         rows = int(np.floor(np.sqrt(num_plots)))  # Number of rows
         cols = int(np.ceil(num_plots / rows))     # Number of columns
 
@@ -169,4 +172,4 @@ class SimulationPlotter:
         plt.tight_layout()  # Adjust layout to avoid overlapping elements
         plt.subplots_adjust(top=0.9)  # Adjust the top margin for the suptitle
         
-        plt.savefig(f"DeePC_Quadcopter/Plots/{self.name}_{title}.png")
+        plt.savefig(PLOTS_DIR / f"{self.name}_{title}.png")
