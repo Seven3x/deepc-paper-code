@@ -5,7 +5,7 @@ from scipy.integrate import quad_vec, quad
 import control
 
 class Quadcopter:
-    def __init__(self, h):
+    def __init__(self, h, measurement_config=None):
         self.n = 12
         self.m = 4
         self.h = h #ZOH sampling time
@@ -83,6 +83,11 @@ class Quadcopter:
         self.Q[-3,-3] = 200 # x cost
         self.R = 1*np.eye(self.m)
 
+        self.measurement_config = self._normalize_measurement_config(measurement_config)
+        self._measurement_rng = np.random.default_rng(self.measurement_config["seed"])
+        self._measurement_step = 0
+        self._current_yaw_bias = self.measurement_config["yaw_bias"]
+
         # Linearize dynamics around the stationary point
         self.linearize()
 
@@ -149,8 +154,43 @@ class Quadcopter:
         return xdot
 
     def measure_output(self, x):
-        y = self.C @ x #measure position
+        y = self.C @ x
+
+        noise_std = self.measurement_config["noise_std"]
+        if np.any(noise_std > 0):
+            y = y + self._measurement_rng.normal(loc=0.0, scale=noise_std, size=self.p)
+
+        yaw_output_index = 2
+        y[yaw_output_index] += self._current_yaw_bias
+        self._current_yaw_bias += self.measurement_config["yaw_drift_per_sec"] * self.h
+        self._measurement_step += 1
+
         return y
+
+    def _normalize_measurement_config(self, measurement_config):
+        config = {
+            "noise_std": np.zeros(self.p),
+            "yaw_bias": 0.0,
+            "yaw_drift_per_sec": 0.0,
+            "seed": 0,
+        }
+        if measurement_config is None:
+            return config
+
+        config["yaw_bias"] = float(measurement_config.get("yaw_bias", 0.0))
+        config["yaw_drift_per_sec"] = float(measurement_config.get("yaw_drift_per_sec", 0.0))
+        config["seed"] = int(measurement_config.get("seed", 0))
+
+        noise_std = measurement_config.get("noise_std", 0.0)
+        if np.isscalar(noise_std):
+            config["noise_std"] = float(noise_std) * np.ones(self.p)
+        else:
+            noise_std = np.asarray(noise_std, dtype=float)
+            if noise_std.shape != (self.p,):
+                raise ValueError(f"measurement noise_std must have shape ({self.p},), got {noise_std.shape}")
+            config["noise_std"] = noise_std
+
+        return config
     
     def output_constraint(self, y):
         return self.F@y <= self.f

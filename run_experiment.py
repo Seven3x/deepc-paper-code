@@ -16,6 +16,37 @@ from quadcopter import Quadcopter
 from trajectory_generator import TrajectoryGenerator
 
 
+def parse_float_list(raw):
+    return [float(item.strip()) for item in raw.split(",") if item.strip()]
+
+
+def build_measurement_config(args):
+    noise_std = parse_float_list(args.measurement_noise_std)
+    if len(noise_std) == 1:
+        noise_std = noise_std[0]
+    elif len(noise_std) != 6:
+        raise ValueError("--measurement-noise-std must provide either 1 value or 6 comma-separated values")
+
+    return {
+        "noise_std": noise_std,
+        "yaw_bias": args.measurement_yaw_bias,
+        "yaw_drift_per_sec": args.measurement_yaw_drift_per_sec,
+        "seed": args.measurement_seed,
+    }
+
+
+def serialize_measurement_config(config):
+    noise_std = config["noise_std"]
+    if isinstance(noise_std, np.ndarray):
+        noise_std = noise_std.tolist()
+    return {
+        "noise_std": noise_std,
+        "yaw_bias": float(config["yaw_bias"]),
+        "yaw_drift_per_sec": float(config["yaw_drift_per_sec"]),
+        "seed": int(config["seed"]),
+    }
+
+
 def build_controller(args, system, trajectory):
     if args.controller == "lqr":
         return LQRTrackingController(
@@ -74,8 +105,12 @@ def compute_metrics(result, trajectory):
 
 def run_single_experiment(args):
     ensure_output_dirs()
+    measurement_config = build_measurement_config(args)
 
-    system = Quadcopter(h=args.sampling_time)
+    system = Quadcopter(
+        h=args.sampling_time,
+        measurement_config=measurement_config,
+    )
     has_initial_ref = args.controller == "deepc"
     trajectory = TrajectoryGenerator(
         sort=args.trajectory,
@@ -116,6 +151,7 @@ def run_single_experiment(args):
         "lqr_noise": args.lqr_noise,
         "regularized": args.controller != "deepc" or not args.disable_regularization,
         "metrics": metrics,
+        "measurement": serialize_measurement_config(measurement_config),
     }
 
     if args.controller == "deepc":
@@ -172,6 +208,10 @@ def build_parser():
     parser.add_argument("--save-hdf5", action="store_true")
     parser.add_argument("--save-plots", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--measurement-noise-std", default="0,0,0,0,0,0")
+    parser.add_argument("--measurement-yaw-bias", type=float, default=0.0)
+    parser.add_argument("--measurement-yaw-drift-per-sec", type=float, default=0.0)
+    parser.add_argument("--measurement-seed", type=int, default=0)
     return parser
 
 
