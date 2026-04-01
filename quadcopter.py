@@ -5,7 +5,7 @@ from scipy.integrate import quad_vec, quad
 import control
 
 class Quadcopter:
-    def __init__(self, h, measurement_config=None):
+    def __init__(self, h, measurement_config=None, output_set="xyzpsi"):
         self.n = 12
         self.m = 4
         self.h = h #ZOH sampling time
@@ -14,8 +14,8 @@ class Quadcopter:
                             0,0,0,
                             0,0,0]) # Initial state vector
 
-        # Assume full state measurement
-        self.output_indices = [0,1,2,9,10,11]
+        self.output_set = output_set
+        self.output_indices = self._build_output_indices(output_set)
         self.p = len(self.output_indices)
         self.C = np.zeros((len(self.output_indices), self.n))
         for i, idx in enumerate(self.output_indices):
@@ -74,13 +74,7 @@ class Quadcopter:
         self.g = np.hstack((self.u_upper, -self.u_lower))
 
         # np.cost parameters for predictive control
-        self.Q = np.eye(self.p)
-        self.Q[0,0] = 1 # Phi cost
-        self.Q[1,1] = 1 # Theta cost
-        self.Q[2,2] = 1 # Psi cost
-        self.Q[-1,-1] = 100 # z cost
-        self.Q[-2,-2] = 200 # y cost
-        self.Q[-3,-3] = 200 # x cost
+        self.Q = np.diag([self._output_cost(idx) for idx in self.output_indices])
         self.R = 1*np.eye(self.m)
 
         self.measurement_config = self._normalize_measurement_config(measurement_config)
@@ -144,6 +138,22 @@ class Quadcopter:
             ])
 
         return xdot
+
+    def _build_output_indices(self, output_set):
+        if output_set == "xyzpsi":
+            return [0, 1, 2, 9, 10, 11]
+        if output_set == "xyz":
+            return [9, 10, 11]
+        raise ValueError(f"Unsupported output_set: {output_set}")
+
+    def _output_cost(self, state_index):
+        if state_index == 9:
+            return 200.0
+        if state_index == 10:
+            return 200.0
+        if state_index == 11:
+            return 100.0
+        return 1.0
         
     def discrete_dynamics(self, x, u, use_casadi=False): #Nonlinear discrete dynamics
         x_next = x + self.h * self.dynamics(x, u, use_casadi=use_casadi)
@@ -160,12 +170,19 @@ class Quadcopter:
         if np.any(noise_std > 0):
             y = y + self._measurement_rng.normal(loc=0.0, scale=noise_std, size=self.p)
 
-        yaw_output_index = 2
-        y[yaw_output_index] += self._current_yaw_bias
+        yaw_output_index = self._yaw_output_index()
+        if yaw_output_index is not None:
+            y[yaw_output_index] += self._current_yaw_bias
         self._current_yaw_bias += self.measurement_config["yaw_drift_per_sec"] * self.h
         self._measurement_step += 1
 
         return y
+
+    def _yaw_output_index(self):
+        for i, idx in enumerate(self.output_indices):
+            if idx == 2:
+                return i
+        return None
 
     def _normalize_measurement_config(self, measurement_config):
         config = {

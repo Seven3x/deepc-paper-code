@@ -117,11 +117,17 @@ class TrajectoryGenerator:
         '''
 
         ref = self.extend_reference(self.output_reference[:,0].reshape(-1,1), length)
-        z_freq = 0.2
-        sin_signal = np.sin(2*np.pi*z_freq*np.linspace(0, self.system.h*length, length))
-        z_ref = 0.1*np.sign(sin_signal)
+        time = np.linspace(0, self.system.h * length, length)
 
-        ref[-1, :] = z_ref
+        if getattr(self.system, "output_set", "xyzpsi") == "xyz":
+            ref[0, :] = 0.15 * np.sign(np.sin(2 * np.pi * 0.13 * time))
+            ref[1, :] = 0.12 * np.sign(np.sin(2 * np.pi * 0.17 * time + np.pi / 3))
+            ref[2, :] = 0.10 * np.sign(np.sin(2 * np.pi * 0.21 * time))
+        else:
+            z_freq = 0.2
+            sin_signal = np.sin(2*np.pi*z_freq*time)
+            z_ref = 0.1*np.sign(sin_signal)
+            ref[-1, :] = z_ref
 
         return ref
     

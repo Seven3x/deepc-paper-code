@@ -19,6 +19,7 @@ class DeePC:
         residual_weight_floor=1.0e-3,
         residual_weight_min=0.1,
         residual_weight_max=2.0,
+        data_length_extra=0,
     ):
         '''Initialize DeePC controller'''
 
@@ -33,8 +34,10 @@ class DeePC:
         self.data_is_persistently_exciting = False
 
         self.T_ini = t_ini # >= l(B) (how many past datapoints we need for indirect initial state estimation, consider observability matrix)
-        self.T = (self.T_ini + self.N)*(1+self.m+self.p) - 1
-        self.T += 0
+        data_length_from_outputs = (self.T_ini + self.N) * (1 + self.m + self.p) - 1
+        persistence_order = self.T_ini + self.N + self.n
+        min_data_length_for_inputs = (self.m + 1) * persistence_order - 1
+        self.T = max(data_length_from_outputs, min_data_length_for_inputs) + data_length_extra
         self.solver = solver
         self.regularization_mode = regularization_mode
         self.residual_weight_floor = residual_weight_floor
