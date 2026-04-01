@@ -14,6 +14,8 @@ class DeePC:
         lambda_y=1.0e4,
         lambda_g=30.0,
         solver=None,
+        regularization_mode="uniform",
+        sigma_y_group_weights=None,
     ):
         '''Initialize DeePC controller'''
 
@@ -31,6 +33,7 @@ class DeePC:
         self.T = (self.T_ini + self.N)*(1+self.m+self.p) - 1
         self.T += 0
         self.solver = solver
+        self.regularization_mode = regularization_mode
 
         self.trajectory = trajectory
         if self.trajectory.has_initial_ref:
@@ -61,6 +64,7 @@ class DeePC:
             self.sigma_y = cp.Variable((self.p, self.T_ini))
             self.lambda_y = lambda_y
             self.lambda_g = lambda_g
+            self.sigma_y_group_weights = self._normalize_sigma_y_group_weights(sigma_y_group_weights)
 
         self.con = self.setup_constraints()
         self.cost = self.setup_cost()
@@ -139,9 +143,23 @@ class DeePC:
             cost += cp.quad_form(self.y[:,k]-self.ref[:,k], self.system.Q) + cp.quad_form(self.u[:,k]-self.system.u_eq, self.system.R)
     
         if self.is_regularized:
-            cost += self.lambda_g*cp.norm2(self.g-self.g_r) + self.lambda_y*cp.norm2(self.sigma_y)
+            weighted_sigma_y = cp.multiply(self.sigma_y_group_weights, self.sigma_y)
+            cost += self.lambda_g*cp.norm2(self.g-self.g_r) + self.lambda_y*cp.norm2(weighted_sigma_y)
 
         return cost
+
+    def _normalize_sigma_y_group_weights(self, sigma_y_group_weights):
+        if sigma_y_group_weights is None:
+            return np.ones((self.p, 1))
+
+        weights = np.asarray(sigma_y_group_weights, dtype=float)
+        if weights.shape == (self.p,):
+            weights = weights.reshape(self.p, 1)
+        if weights.shape != (self.p, 1):
+            raise ValueError(f"sigma_y_group_weights must have shape ({self.p},) or ({self.p}, 1), got {weights.shape}")
+        if np.any(weights <= 0):
+            raise ValueError("sigma_y_group_weights must be strictly positive")
+        return weights
 
     def compute_input(self, x_current):
         y_current = self.system.measure_output(x_current)

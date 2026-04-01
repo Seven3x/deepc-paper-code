@@ -47,6 +47,25 @@ def serialize_measurement_config(config):
     }
 
 
+def build_sigma_y_group_weights(args, system):
+    if args.deepc_regularization_mode == "uniform":
+        return None
+
+    if args.deepc_regularization_mode == "manual_grouped":
+        weights = np.ones(system.p)
+        weights[:3] = args.deepc_attitude_slack_weight
+        weights[3:] = args.deepc_position_slack_weight
+        return weights
+
+    if args.deepc_regularization_mode == "manual_output":
+        weights = parse_float_list(args.deepc_output_slack_weights)
+        if len(weights) != system.p:
+            raise ValueError(f"--deepc-output-slack-weights must provide exactly {system.p} values")
+        return np.asarray(weights, dtype=float)
+
+    raise ValueError(f"Unsupported DeePC regularization mode: {args.deepc_regularization_mode}")
+
+
 def build_controller(args, system, trajectory):
     if args.controller == "lqr":
         return LQRTrackingController(
@@ -68,6 +87,8 @@ def build_controller(args, system, trajectory):
             lambda_y=args.deepc_lambda_y,
             lambda_g=args.deepc_lambda_g,
             solver=args.deepc_solver,
+            regularization_mode=args.deepc_regularization_mode,
+            sigma_y_group_weights=build_sigma_y_group_weights(args, system),
         )
 
     if args.controller == "mpc":
@@ -161,6 +182,10 @@ def run_single_experiment(args):
             "lambda_y": args.deepc_lambda_y,
             "lambda_g": args.deepc_lambda_g,
             "solver": args.deepc_solver,
+            "regularization_mode": args.deepc_regularization_mode,
+            "attitude_slack_weight": args.deepc_attitude_slack_weight,
+            "position_slack_weight": args.deepc_position_slack_weight,
+            "output_slack_weights": parse_float_list(args.deepc_output_slack_weights),
             "data_length_T": int(controller.T),
         }
     if args.controller == "mpc":
@@ -202,6 +227,10 @@ def build_parser():
     parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1.0e4)
     parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=30.0)
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
+    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output"], default="uniform")
+    parser.add_argument("--deepc-attitude-slack-weight", type=float, default=1.0)
+    parser.add_argument("--deepc-position-slack-weight", type=float, default=1.0)
+    parser.add_argument("--deepc-output-slack-weights", default="1,1,1,1,1,1")
     parser.add_argument("--mpc-N", dest="mpc_N", type=int, default=10)
     parser.add_argument("--mpc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
     parser.add_argument("--tag", default="")
