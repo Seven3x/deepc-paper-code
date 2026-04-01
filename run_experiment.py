@@ -74,6 +74,9 @@ def build_sigma_y_group_weights(args, system):
         weights = inv_std / median_inv_std
         return np.clip(weights, args.deepc_measurement_weight_min, args.deepc_measurement_weight_max)
 
+    if args.deepc_regularization_mode == "residual_stats":
+        return np.ones(system.p)
+
     raise ValueError(f"Unsupported DeePC regularization mode: {args.deepc_regularization_mode}")
 
 
@@ -100,6 +103,9 @@ def build_controller(args, system, trajectory):
             solver=args.deepc_solver,
             regularization_mode=args.deepc_regularization_mode,
             sigma_y_group_weights=build_sigma_y_group_weights(args, system),
+            residual_weight_floor=args.deepc_residual_weight_floor,
+            residual_weight_min=args.deepc_residual_weight_min,
+            residual_weight_max=args.deepc_residual_weight_max,
         )
 
     if args.controller == "mpc":
@@ -197,6 +203,10 @@ def run_single_experiment(args):
             "attitude_slack_weight": args.deepc_attitude_slack_weight,
             "position_slack_weight": args.deepc_position_slack_weight,
             "output_slack_weights": parse_float_list(args.deepc_output_slack_weights),
+            "residual_weight_floor": args.deepc_residual_weight_floor,
+            "residual_weight_min": args.deepc_residual_weight_min,
+            "residual_weight_max": args.deepc_residual_weight_max,
+            "effective_sigma_y_weights": np.asarray(controller.sigma_y_group_weights.value).reshape(-1).tolist(),
             "data_length_T": int(controller.T),
         }
     if args.controller == "mpc":
@@ -238,13 +248,16 @@ def build_parser():
     parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1.0e4)
     parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=30.0)
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
-    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise"], default="uniform")
+    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise", "residual_stats"], default="uniform")
     parser.add_argument("--deepc-attitude-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-position-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-output-slack-weights", default="1,1,1,1,1,1")
     parser.add_argument("--deepc-measurement-noise-floor", type=float, default=0.01)
     parser.add_argument("--deepc-measurement-weight-min", type=float, default=0.1)
     parser.add_argument("--deepc-measurement-weight-max", type=float, default=2.0)
+    parser.add_argument("--deepc-residual-weight-floor", type=float, default=0.01)
+    parser.add_argument("--deepc-residual-weight-min", type=float, default=0.1)
+    parser.add_argument("--deepc-residual-weight-max", type=float, default=2.0)
     parser.add_argument("--mpc-N", dest="mpc_N", type=int, default=10)
     parser.add_argument("--mpc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
     parser.add_argument("--tag", default="")

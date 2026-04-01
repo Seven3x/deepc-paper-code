@@ -76,6 +76,11 @@ def make_args(base_args, trajectory, scenario_name, variant_name, suite_name, ar
         run_args.deepc_attitude_slack_weight = 1.0
         run_args.deepc_position_slack_weight = 1.0
         run_args.deepc_output_slack_weights = "1,1,1,1,1,1"
+    elif variant_name == "residual_stats":
+        run_args.deepc_regularization_mode = "residual_stats"
+        run_args.deepc_attitude_slack_weight = 1.0
+        run_args.deepc_position_slack_weight = 1.0
+        run_args.deepc_output_slack_weights = "1,1,1,1,1,1"
     else:
         raise ValueError(variant_name)
 

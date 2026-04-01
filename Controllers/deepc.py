@@ -16,6 +16,9 @@ class DeePC:
         solver=None,
         regularization_mode="uniform",
         sigma_y_group_weights=None,
+        residual_weight_floor=1.0e-3,
+        residual_weight_min=0.1,
+        residual_weight_max=2.0,
     ):
         '''Initialize DeePC controller'''
 
@@ -34,6 +37,9 @@ class DeePC:
         self.T += 0
         self.solver = solver
         self.regularization_mode = regularization_mode
+        self.residual_weight_floor = residual_weight_floor
+        self.residual_weight_min = residual_weight_min
+        self.residual_weight_max = residual_weight_max
 
         self.trajectory = trajectory
         if self.trajectory.has_initial_ref:
@@ -64,7 +70,8 @@ class DeePC:
             self.sigma_y = cp.Variable((self.p, self.T_ini))
             self.lambda_y = lambda_y
             self.lambda_g = lambda_g
-            self.sigma_y_group_weights = self._normalize_sigma_y_group_weights(sigma_y_group_weights)
+            self.sigma_y_group_weights = cp.Parameter((self.p, 1), nonneg=True)
+            self.sigma_y_group_weights.value = self._normalize_sigma_y_group_weights(sigma_y_group_weights)
 
         self.con = self.setup_constraints()
         self.cost = self.setup_cost()
@@ -74,6 +81,7 @@ class DeePC:
         # Empty data arrays
         self.u_d = []
         self.y_d = []
+        self.measurement_residual_d = []
 
     def construct_hankel_matrix(self, x, L):
         '''
@@ -108,6 +116,9 @@ class DeePC:
         self.Y_f.value = Y_d[self.p*self.T_ini:,:]
 
         self.Hpinv = np.linalg.pinv(np.vstack((self.U_p.value, self.Y_p.value, self.U_f.value, self.Y_f.value)))
+
+        if self.is_regularized and self.regularization_mode == "residual_stats":
+            self.sigma_y_group_weights.value = self._compute_residual_stat_weights()
 
         print("Hankel matrices created and partitioned.")
 
@@ -161,15 +172,26 @@ class DeePC:
             raise ValueError("sigma_y_group_weights must be strictly positive")
         return weights
 
+    def _compute_residual_stat_weights(self):
+        residuals = self.measurement_residual_d
+        residual_rms = np.sqrt(np.mean(np.square(residuals), axis=1))
+        effective_rms = np.maximum(residual_rms, self.residual_weight_floor)
+        inv_rms = 1.0 / effective_rms
+        median_inv_rms = np.median(inv_rms)
+        weights = inv_rms / median_inv_rms
+        weights = np.clip(weights, self.residual_weight_min, self.residual_weight_max)
+        return weights.reshape(self.p, 1)
+
     def compute_input(self, x_current):
         y_current = self.system.measure_output(x_current)
+        measurement_residual = y_current - (self.system.C @ x_current)
 
         if self.data_is_persistently_exciting:
             u_optimal = self.compute_optimal_control()
         else:
             u_optimal = self.initial_controller.compute_input(x_current, self.ref.value[:,0])
             
-        self.collect_and_update(y_current, u_optimal)
+        self.collect_and_update(y_current, u_optimal, measurement_residual)
 
         return u_optimal
     
@@ -186,8 +208,7 @@ class DeePC:
 
         return u_optimal
 
-    def collect_and_update(self, y_current, u_optimal):
-
+    def collect_and_update(self, y_current, u_optimal, measurement_residual):
         self.y_ini.value[:,:-1] = self.y_ini.value[:,1:]
         self.u_ini.value[:,:-1] = self.u_ini.value[:,1:]
 
@@ -200,10 +221,12 @@ class DeePC:
         if not self.data_is_persistently_exciting:
             self.u_d.append(u_optimal)
             self.y_d.append(y_current)
+            self.measurement_residual_d.append(measurement_residual)
 
             if len(self.u_d) == self.T:
                 self.u_d = np.array(self.u_d).T
                 self.y_d = np.array(self.y_d).T
+                self.measurement_residual_d = np.array(self.measurement_residual_d).T
                 self.create_and_partition_hankel_matrices()
                 self.data_is_persistently_exciting = self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
         
