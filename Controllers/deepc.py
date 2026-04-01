@@ -19,6 +19,9 @@ class DeePC:
         residual_weight_floor=1.0e-3,
         residual_weight_min=0.1,
         residual_weight_max=2.0,
+        block_lambda_roll_pitch=None,
+        block_lambda_yaw=None,
+        block_lambda_position=None,
         data_length_extra=0,
     ):
         '''Initialize DeePC controller'''
@@ -43,6 +46,9 @@ class DeePC:
         self.residual_weight_floor = residual_weight_floor
         self.residual_weight_min = residual_weight_min
         self.residual_weight_max = residual_weight_max
+        self.block_lambda_roll_pitch = block_lambda_roll_pitch if block_lambda_roll_pitch is not None else lambda_y
+        self.block_lambda_yaw = block_lambda_yaw if block_lambda_yaw is not None else lambda_y
+        self.block_lambda_position = block_lambda_position if block_lambda_position is not None else lambda_y
 
         self.trajectory = trajectory
         if self.trajectory.has_initial_ref:
@@ -157,10 +163,40 @@ class DeePC:
             cost += cp.quad_form(self.y[:,k]-self.ref[:,k], self.system.Q) + cp.quad_form(self.u[:,k]-self.system.u_eq, self.system.R)
     
         if self.is_regularized:
-            weighted_sigma_y = cp.multiply(self.sigma_y_group_weights, self.sigma_y)
-            cost += self.lambda_g*cp.norm2(self.g-self.g_r) + self.lambda_y*cp.norm2(weighted_sigma_y)
+            cost += self.lambda_g*cp.norm2(self.g-self.g_r)
+            if self.regularization_mode == "block_l2":
+                cost += self._block_sigma_y_cost()
+            else:
+                weighted_sigma_y = cp.multiply(self.sigma_y_group_weights, self.sigma_y)
+                cost += self.lambda_y*cp.norm2(weighted_sigma_y)
 
         return cost
+
+    def _block_sigma_y_cost(self):
+        cost = 0
+        block_rows = self._sigma_y_blocks()
+        if block_rows["roll_pitch"]:
+            cost += self.block_lambda_roll_pitch * cp.norm2(self.sigma_y[block_rows["roll_pitch"], :])
+        if block_rows["yaw"]:
+            cost += self.block_lambda_yaw * cp.norm2(self.sigma_y[block_rows["yaw"], :])
+        if block_rows["position"]:
+            cost += self.block_lambda_position * cp.norm2(self.sigma_y[block_rows["position"], :])
+        return cost
+
+    def _sigma_y_blocks(self):
+        blocks = {
+            "roll_pitch": [],
+            "yaw": [],
+            "position": [],
+        }
+        for row, state_index in enumerate(self.system.output_indices):
+            if state_index in (0, 1):
+                blocks["roll_pitch"].append(row)
+            elif state_index == 2:
+                blocks["yaw"].append(row)
+            elif state_index in (9, 10, 11):
+                blocks["position"].append(row)
+        return blocks
 
     def _normalize_sigma_y_group_weights(self, sigma_y_group_weights):
         if sigma_y_group_weights is None:

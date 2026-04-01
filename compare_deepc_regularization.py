@@ -59,6 +59,9 @@ def make_args(base_args, trajectory, scenario_name, variant_name, suite_name, ar
     run_args.deepc_solver = "CLARABEL"
     run_args.deepc_initial_controller = "lqr"
     run_args.deepc_random_excitation_amplitude = 0.15
+    run_args.deepc_block_lambda_roll_pitch = None
+    run_args.deepc_block_lambda_yaw = None
+    run_args.deepc_block_lambda_position = None
 
     if variant_name == "uniform":
         run_args.deepc_regularization_mode = "uniform"
@@ -85,6 +88,14 @@ def make_args(base_args, trajectory, scenario_name, variant_name, suite_name, ar
         run_args.deepc_attitude_slack_weight = 1.0
         run_args.deepc_position_slack_weight = 1.0
         run_args.deepc_output_slack_weights = "1,1,1,1,1,1"
+    elif variant_name == "block_yaw_relaxed":
+        run_args.deepc_regularization_mode = "block_l2"
+        run_args.deepc_attitude_slack_weight = 1.0
+        run_args.deepc_position_slack_weight = 1.0
+        run_args.deepc_output_slack_weights = "1,1,1,1,1,1"
+        run_args.deepc_block_lambda_roll_pitch = args.block_lambda_roll_pitch
+        run_args.deepc_block_lambda_yaw = args.block_lambda_yaw
+        run_args.deepc_block_lambda_position = args.block_lambda_position
     elif variant_name == "xyz_only":
         run_args.output_set = "xyz"
         run_args.deepc_initial_controller = "random"
@@ -123,6 +134,9 @@ def main():
     parser.add_argument("--manual-attitude-weight", type=float, default=0.2)
     parser.add_argument("--manual-position-weight", type=float, default=1.0)
     parser.add_argument("--manual-yaw-only-weights", default="1,1,0.2,1,1,1")
+    parser.add_argument("--block-lambda-roll-pitch", type=float, default=1000.0)
+    parser.add_argument("--block-lambda-yaw", type=float, default=250.0)
+    parser.add_argument("--block-lambda-position", type=float, default=1000.0)
     parser.add_argument("--xyz-random-excitation-amplitude", type=float, default=0.2)
     parser.add_argument("--max-position-error", type=float, default=2.0)
     parser.add_argument("--max-yaw-error", type=float, default=1.0)
