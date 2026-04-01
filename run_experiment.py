@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from Controllers.deepc import DeePC
+from Controllers.linear_mpc import LinearMPC
 from Controllers.lqr_tracking import LQRTrackingController
 from Controllers.lqr import LQR
 from Simulator.simulation import Simulation, SimulationPlotter
@@ -36,6 +37,14 @@ def build_controller(args, system, trajectory):
             lambda_y=args.deepc_lambda_y,
             lambda_g=args.deepc_lambda_g,
             solver=args.deepc_solver,
+        )
+
+    if args.controller == "mpc":
+        return LinearMPC(
+            system=system,
+            trajectory=trajectory,
+            horizon=args.mpc_N,
+            solver=args.mpc_solver,
         )
 
     raise ValueError(f"Unsupported controller: {args.controller}")
@@ -118,6 +127,11 @@ def run_single_experiment(args):
             "solver": args.deepc_solver,
             "data_length_T": int(controller.T),
         }
+    if args.controller == "mpc":
+        output["mpc"] = {
+            "N": args.mpc_N,
+            "solver": args.mpc_solver,
+        }
 
     run_dir = RESULTS_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -139,7 +153,7 @@ def run_single_experiment(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Run a reproducible DeePC quadcopter experiment.")
-    parser.add_argument("--controller", choices=["lqr", "deepc"], required=True)
+    parser.add_argument("--controller", choices=["lqr", "mpc", "deepc"], required=True)
     parser.add_argument("--trajectory", choices=["constant", "figure8", "step", "box"], default="figure8")
     parser.add_argument("--reference-duration", type=float, default=12.0)
     parser.add_argument("--sampling-time", type=float, default=0.1)
@@ -152,6 +166,8 @@ def build_parser():
     parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1.0e4)
     parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=30.0)
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
+    parser.add_argument("--mpc-N", dest="mpc_N", type=int, default=10)
+    parser.add_argument("--mpc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
     parser.add_argument("--tag", default="")
     parser.add_argument("--save-hdf5", action="store_true")
     parser.add_argument("--save-plots", action="store_true")
