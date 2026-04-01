@@ -63,6 +63,17 @@ def build_sigma_y_group_weights(args, system):
             raise ValueError(f"--deepc-output-slack-weights must provide exactly {system.p} values")
         return np.asarray(weights, dtype=float)
 
+    if args.deepc_regularization_mode == "measurement_noise":
+        noise_std = np.asarray(system.measurement_config["noise_std"], dtype=float)
+        if np.allclose(noise_std, 0.0):
+            return np.ones(system.p)
+
+        effective_std = np.maximum(noise_std, args.deepc_measurement_noise_floor)
+        inv_std = 1.0 / effective_std
+        median_inv_std = np.median(inv_std)
+        weights = inv_std / median_inv_std
+        return np.clip(weights, args.deepc_measurement_weight_min, args.deepc_measurement_weight_max)
+
     raise ValueError(f"Unsupported DeePC regularization mode: {args.deepc_regularization_mode}")
 
 
@@ -227,10 +238,13 @@ def build_parser():
     parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1.0e4)
     parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=30.0)
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
-    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output"], default="uniform")
+    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise"], default="uniform")
     parser.add_argument("--deepc-attitude-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-position-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-output-slack-weights", default="1,1,1,1,1,1")
+    parser.add_argument("--deepc-measurement-noise-floor", type=float, default=0.01)
+    parser.add_argument("--deepc-measurement-weight-min", type=float, default=0.1)
+    parser.add_argument("--deepc-measurement-weight-max", type=float, default=2.0)
     parser.add_argument("--mpc-N", dest="mpc_N", type=int, default=10)
     parser.add_argument("--mpc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
     parser.add_argument("--tag", default="")
