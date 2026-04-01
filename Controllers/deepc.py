@@ -1,13 +1,23 @@
 import numpy as np
 import cvxpy as cp
-from hdf5_reader import HDF5Reader
 
 class DeePC:
     
-    def __init__(self, system, trajectory, initial_controller, is_regularized=True):
+    def __init__(
+        self,
+        system,
+        trajectory,
+        initial_controller,
+        is_regularized=True,
+        prediction_horizon=25,
+        t_ini=6,
+        lambda_y=1.0e4,
+        lambda_g=30.0,
+        solver=None,
+    ):
         '''Initialize DeePC controller'''
 
-        self.N = 25 # Prediction horizon
+        self.N = prediction_horizon # Prediction horizon
         
         self.system = system
         self.n = system.n
@@ -17,9 +27,10 @@ class DeePC:
         self.initial_controller = initial_controller
         self.data_is_persistently_exciting = False
 
-        self.T_ini = 6 # >= l(B) (how many past datapoints we need for indirect initial state estimation, consider observability matrix)
+        self.T_ini = t_ini # >= l(B) (how many past datapoints we need for indirect initial state estimation, consider observability matrix)
         self.T = (self.T_ini + self.N)*(1+self.m+self.p) - 1
         self.T += 0
+        self.solver = solver
 
         self.trajectory = trajectory
         if self.trajectory.has_initial_ref:
@@ -48,8 +59,8 @@ class DeePC:
         self.is_regularized = is_regularized
         if is_regularized:
             self.sigma_y = cp.Variable((self.p, self.T_ini))
-            self.lambda_y = 10e3
-            self.lambda_g = 30
+            self.lambda_y = lambda_y
+            self.lambda_g = lambda_g
 
         self.con = self.setup_constraints()
         self.cost = self.setup_cost()
@@ -145,7 +156,14 @@ class DeePC:
         return u_optimal
     
     def compute_optimal_control(self):
-        self.problem.solve(verbose=False)
+        solve_kwargs = {
+            "verbose": False,
+            "ignore_dpp": True,
+        }
+        if self.solver is not None:
+            solve_kwargs["solver"] = self.solver
+
+        self.problem.solve(**solve_kwargs)
         u_optimal = self.u[:, 0].value
 
         return u_optimal

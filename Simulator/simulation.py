@@ -10,7 +10,7 @@ class Simulation:
     A simulation class that integrates a given system's dynamics and applies a controller.
     """
     
-    def __init__(self, system, controller, dt=0.001, t_final=10):
+    def __init__(self, system, controller, dt=0.001, t_final=10, verbose=True):
         """
         Initializes the simulation.
         
@@ -24,6 +24,7 @@ class Simulation:
         self.controller = controller
         self.dt = dt
         self.t_final = t_final
+        self.verbose = verbose
 
     def rk4(self, x, u):
         """
@@ -60,7 +61,8 @@ class Simulation:
         - y_data: Array of measured outputs.
         """
 
-        print("Simulating...")
+        if self.verbose:
+            print("Simulating...")
         
         time_steps = int(self.t_final / self.dt)
         time = np.linspace(0, self.t_final, time_steps + 1)
@@ -89,7 +91,8 @@ class Simulation:
                 y_data.append(y)
                 k += 1
 
-                print(f"Time: {t:.2f}s, Input: {u}, Output: {y}")
+                if self.verbose:
+                    print(f"Time: {t:.2f}s, Input: {u}, Output: {y}")
 
             x = self.rk4(x, u)                 # Integrate system dynamics
             # Store data

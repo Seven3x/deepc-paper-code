@@ -31,6 +31,11 @@ def build_controller(args, system, trajectory):
             trajectory,
             initial_controller,
             is_regularized=not args.disable_regularization,
+            prediction_horizon=args.deepc_N,
+            t_ini=args.deepc_T_ini,
+            lambda_y=args.deepc_lambda_y,
+            lambda_g=args.deepc_lambda_g,
+            solver=args.deepc_solver,
         )
 
     raise ValueError(f"Unsupported controller: {args.controller}")
@@ -52,25 +57,13 @@ def compute_metrics(result, trajectory):
         "rmse_yaw": float(np.sqrt(np.mean(np.square(yaw_err)))),
         "final_position_error_norm": float(np.linalg.norm(pos_err[:, -1])),
         "max_abs_position_error": float(np.max(np.abs(pos_err))),
+        "max_abs_yaw_error": float(np.max(np.abs(yaw_err))),
+        "all_finite": bool(np.isfinite(y).all()),
     }
     return metrics
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Run a reproducible DeePC quadcopter experiment.")
-    parser.add_argument("--controller", choices=["lqr", "deepc"], required=True)
-    parser.add_argument("--trajectory", choices=["constant", "figure8", "step", "box"], default="figure8")
-    parser.add_argument("--reference-duration", type=float, default=12.0)
-    parser.add_argument("--sampling-time", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--lqr-noise", type=float, default=0.0)
-    parser.add_argument("--disable-regularization", action="store_true")
-    parser.add_argument("--dt", type=float, default=0.001)
-    parser.add_argument("--tag", default="")
-    parser.add_argument("--save-hdf5", action="store_true")
-    parser.add_argument("--save-plots", action="store_true")
-    args = parser.parse_args()
-
+def run_single_experiment(args):
     ensure_output_dirs()
 
     system = Quadcopter(h=args.sampling_time)
@@ -88,7 +81,13 @@ def main():
     else:
         t_final = args.reference_duration
 
-    sim = Simulation(system, controller, dt=args.dt, t_final=t_final)
+    sim = Simulation(
+        system,
+        controller,
+        dt=args.dt,
+        t_final=t_final,
+        verbose=not args.quiet,
+    )
     result = sim.simulate()
     metrics = compute_metrics(result, trajectory)
 
@@ -110,6 +109,16 @@ def main():
         "metrics": metrics,
     }
 
+    if args.controller == "deepc":
+        output["deepc"] = {
+            "T_ini": args.deepc_T_ini,
+            "N": args.deepc_N,
+            "lambda_y": args.deepc_lambda_y,
+            "lambda_g": args.deepc_lambda_g,
+            "solver": args.deepc_solver,
+            "data_length_T": int(controller.T),
+        }
+
     run_dir = RESULTS_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,6 +134,35 @@ def main():
         plotter.plot(result, trajectory)
 
     print(json.dumps(output, indent=2, ensure_ascii=False))
+    return output
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Run a reproducible DeePC quadcopter experiment.")
+    parser.add_argument("--controller", choices=["lqr", "deepc"], required=True)
+    parser.add_argument("--trajectory", choices=["constant", "figure8", "step", "box"], default="figure8")
+    parser.add_argument("--reference-duration", type=float, default=12.0)
+    parser.add_argument("--sampling-time", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lqr-noise", type=float, default=0.0)
+    parser.add_argument("--disable-regularization", action="store_true")
+    parser.add_argument("--dt", type=float, default=0.001)
+    parser.add_argument("--deepc-T-ini", dest="deepc_T_ini", type=int, default=6)
+    parser.add_argument("--deepc-N", dest="deepc_N", type=int, default=25)
+    parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1.0e4)
+    parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=30.0)
+    parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
+    parser.add_argument("--tag", default="")
+    parser.add_argument("--save-hdf5", action="store_true")
+    parser.add_argument("--save-plots", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    run_single_experiment(args)
 
 
 if __name__ == "__main__":

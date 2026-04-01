@@ -36,7 +36,9 @@ class TrajectoryGenerator:
         ref_indieces = t >= start_time
         t_ref = t[ref_indieces]-start_time
         ref = np.zeros((self.system.p, len(t)))
-        frequency = max_frequency * np.exp(-3/t_ref) # Exponential increase of frequency
+        frequency = np.zeros_like(t_ref)
+        positive_mask = t_ref > 0
+        frequency[positive_mask] = max_frequency * np.exp(-3 / t_ref[positive_mask])  # Exponential increase of frequency
         z_step = -1
         ref[:,ref_indieces] = np.vstack((np.zeros((self.system.p-3,len(t_ref))),
                         np.array([a*np.sin(2 * np.pi * frequency * t_ref),
