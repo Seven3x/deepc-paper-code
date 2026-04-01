@@ -96,6 +96,11 @@ def make_args(base_args, trajectory, scenario_name, variant_name, suite_name, ar
         run_args.deepc_block_lambda_roll_pitch = args.block_lambda_roll_pitch
         run_args.deepc_block_lambda_yaw = args.block_lambda_yaw
         run_args.deepc_block_lambda_position = args.block_lambda_position
+    elif variant_name == "yaw_selective_slack":
+        run_args.deepc_regularization_mode = "yaw_selective_slack"
+        run_args.deepc_attitude_slack_weight = 1.0
+        run_args.deepc_position_slack_weight = 1.0
+        run_args.deepc_output_slack_weights = "1,1,1,1,1,1"
     elif variant_name == "xyz_only":
         run_args.output_set = "xyz"
         run_args.deepc_initial_controller = "random"

@@ -32,6 +32,8 @@ class DeePC:
         self.n = system.n
         self.m = system.m
         self.p = system.p
+        self.yaw_output_rows = [row for row, idx in enumerate(system.output_indices) if idx == 2]
+        self.non_yaw_output_rows = [row for row in range(self.p) if row not in self.yaw_output_rows]
 
         self.initial_controller = initial_controller
         self.data_is_persistently_exciting = False
@@ -142,7 +144,20 @@ class DeePC:
             sigma_y = np.reshape(self.sigma_y, (self.p*self.T_ini, 1), order='F')
         
         eq_con = [self.U_p @ self.g == u_ini]
-        eq_con += [self.Y_p @ self.g == y_ini + (sigma_y if self.is_regularized else 0)]
+        if self.regularization_mode == "drop_yaw_past" and self.yaw_output_rows:
+            Y_pg = cp.reshape(self.Y_p @ self.g, (self.p, self.T_ini), order="F")
+            for row in self.non_yaw_output_rows:
+                eq_con += [Y_pg[row, :] == self.y_ini[row, :]]
+        elif self.is_regularized and self.regularization_mode == "yaw_selective_slack" and self.yaw_output_rows:
+            Y_pg = cp.reshape(self.Y_p @ self.g, (self.p, self.T_ini), order="F")
+            for row in self.non_yaw_output_rows:
+                eq_con += [Y_pg[row, :] == self.y_ini[row, :]]
+            for row in self.yaw_output_rows:
+                eq_con += [Y_pg[row, :] == self.y_ini[row, :] + self.sigma_y[row, :]]
+            for row in self.non_yaw_output_rows:
+                eq_con += [self.sigma_y[row, :] == 0]
+        else:
+            eq_con += [self.Y_p @ self.g == y_ini + (sigma_y if self.is_regularized else 0)]
         eq_con += [self.U_f @ self.g == u]
         eq_con += [self.Y_f @ self.g == y]
             
@@ -166,6 +181,8 @@ class DeePC:
             cost += self.lambda_g*cp.norm2(self.g-self.g_r)
             if self.regularization_mode == "block_l2":
                 cost += self._block_sigma_y_cost()
+            elif self.regularization_mode == "yaw_selective_slack":
+                cost += self._yaw_selective_sigma_y_cost()
             else:
                 weighted_sigma_y = cp.multiply(self.sigma_y_group_weights, self.sigma_y)
                 cost += self.lambda_y*cp.norm2(weighted_sigma_y)
@@ -182,6 +199,11 @@ class DeePC:
         if block_rows["position"]:
             cost += self.block_lambda_position * cp.norm2(self.sigma_y[block_rows["position"], :])
         return cost
+
+    def _yaw_selective_sigma_y_cost(self):
+        if not self.yaw_output_rows:
+            return 0
+        return self.lambda_y * cp.norm2(self.sigma_y[self.yaw_output_rows, :])
 
     def _sigma_y_blocks(self):
         blocks = {

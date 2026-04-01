@@ -82,6 +82,12 @@ def build_sigma_y_group_weights(args, system):
     if args.deepc_regularization_mode == "residual_stats":
         return np.ones(system.p)
 
+    if args.deepc_regularization_mode == "yaw_selective_slack":
+        return np.ones(system.p)
+
+    if args.deepc_regularization_mode == "drop_yaw_past":
+        return np.ones(system.p)
+
     if args.deepc_regularization_mode == "block_l2":
         return np.ones(system.p)
 
@@ -288,7 +294,7 @@ def build_parser():
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
     parser.add_argument("--deepc-initial-controller", choices=["lqr", "random"], default="lqr")
     parser.add_argument("--deepc-random-excitation-amplitude", type=float, default=0.15)
-    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise", "residual_stats", "block_l2"], default="uniform")
+    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise", "residual_stats", "block_l2", "yaw_selective_slack", "drop_yaw_past"], default="uniform")
     parser.add_argument("--deepc-attitude-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-position-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-output-slack-weights", default="1,1,1,1,1,1")
