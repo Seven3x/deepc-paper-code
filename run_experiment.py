@@ -54,6 +54,7 @@ def build_fault_config(args):
         "rotor_index": args.fault_rotor_index,
         "efficiency_scale": args.fault_efficiency_scale,
         "health_mode": args.deepc_health_mode,
+        "start_time": args.fault_start_time,
     }
 
 
@@ -79,6 +80,7 @@ def serialize_fault_config(config):
         "rotor_index": int(config["rotor_index"]),
         "efficiency_scale": float(config["efficiency_scale"]),
         "health_mode": str(config["health_mode"]),
+        "start_time": float(config["start_time"]),
     }
 
 
@@ -172,6 +174,7 @@ def build_controller(args, system, trajectory):
             consistency_gate_lambda=args.deepc_consistency_gate_lambda,
             consistency_gate_clip=args.deepc_consistency_gate_clip,
             consistency_gate_eps=args.deepc_consistency_gate_eps,
+            controller_health_mode=args.deepc_health_mode,
         )
 
     if args.controller == "mpc":
@@ -302,6 +305,11 @@ def run_single_experiment(args):
             "latest_measurement_metadata": controller.latest_measurement_metadata,
             "bank_mode": getattr(controller, "bank_mode", "single_bank"),
             "health_mode": getattr(controller, "health_mode", fault_config["health_mode"]),
+            "controller_health_mode": getattr(controller, "controller_health_mode", fault_config["health_mode"]),
+            "plant_health_mode": getattr(controller, "plant_health_mode", "nominal"),
+            "requested_bank_name": getattr(controller, "requested_bank_name", getattr(controller, "health_mode", "nominal")),
+            "control_bank_name": getattr(controller, "control_bank_name", getattr(controller, "health_mode", "nominal")),
+            "training_bank_name": getattr(controller, "training_bank_name", getattr(controller, "health_mode", "nominal")),
         }
     if args.controller == "mpc":
         output["mpc"] = {
@@ -380,6 +388,7 @@ def build_parser():
     parser.add_argument("--fault-mode", choices=["nominal", "single_rotor_efficiency_drop"], default="nominal")
     parser.add_argument("--fault-rotor-index", type=int, default=0)
     parser.add_argument("--fault-efficiency-scale", type=float, default=1.0)
+    parser.add_argument("--fault-start-time", type=float, default=0.0)
     parser.add_argument("--deepc-health-mode", choices=["nominal", "degraded"], default="nominal")
     return parser
 

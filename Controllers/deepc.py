@@ -27,6 +27,7 @@ class DeePC:
         consistency_gate_lambda=3.0,
         consistency_gate_clip=3.0,
         consistency_gate_eps=1.0e-6,
+        controller_health_mode="nominal",
     ):
         '''Initialize DeePC controller'''
 
@@ -37,7 +38,14 @@ class DeePC:
         self.m = system.m
         self.p = system.p
         self.bank_mode = "dual_bank"
-        self.health_mode = getattr(system, "fault_config", {}).get("health_mode", "nominal")
+        self.controller_health_mode = str(controller_health_mode)
+        if self.controller_health_mode not in {"nominal", "degraded"}:
+            raise ValueError("controller_health_mode must be nominal or degraded")
+        self.health_mode = self.controller_health_mode
+        self.plant_health_mode = "nominal"
+        self.requested_bank_name = self.controller_health_mode
+        self.control_bank_name = self.controller_health_mode
+        self.training_bank_name = self.controller_health_mode
         self.yaw_output_rows = [row for row, idx in enumerate(system.output_indices) if idx == 2]
         self.non_yaw_output_rows = [row for row in range(self.p) if row not in self.yaw_output_rows]
 
@@ -354,7 +362,12 @@ class DeePC:
         return weights.reshape(self.p, 1)
 
     def compute_input(self, x_current, y_current=None):
-        self._restore_active_bank_state()
+        self.plant_health_mode = self._plant_health_mode()
+        desired_health_mode = self._desired_health_mode()
+        control_bank = self._select_control_bank(desired_health_mode)
+        self.requested_bank_name = desired_health_mode
+        self.control_bank_name = control_bank
+        self._restore_bank_state(control_bank)
         measurement_packet = self._normalize_measurement_packet(x_current, y_current)
         delivered_y = measurement_packet["output"]
         measurement_residual = measurement_packet["output_mask"] * (
@@ -400,8 +413,11 @@ class DeePC:
         else:
             u_optimal = self.initial_controller.compute_input(x_current, self.ref.value[:,0])
 
+        self._restore_bank_state(desired_health_mode)
+        self.health_mode = desired_health_mode
+        self.training_bank_name = desired_health_mode
         self.collect_and_update(measurement_packet, u_optimal, measurement_residual)
-        self._capture_active_bank_state()
+        self._capture_bank_state_to(desired_health_mode)
 
         return u_optimal
     
@@ -643,6 +659,24 @@ class DeePC:
         requested = getattr(self, "health_mode", "nominal")
         return requested if requested in self.bank_states else "nominal"
 
+    def _plant_health_mode(self):
+        if hasattr(self.system, "current_health_mode"):
+            return self.system.current_health_mode()
+        return "nominal"
+
+    def _desired_health_mode(self):
+        if self.controller_health_mode == "nominal":
+            return "nominal"
+        return self._plant_health_mode()
+
+    def _select_control_bank(self, desired_health_mode):
+        desired_bank = self.bank_states[desired_health_mode]
+        if desired_bank["data_is_persistently_exciting"]:
+            return desired_health_mode
+        if desired_health_mode == "degraded" and self.bank_states["nominal"]["data_is_persistently_exciting"]:
+            return "nominal"
+        return desired_health_mode
+
     def _capture_bank_state(self):
         return {
             "data_is_persistently_exciting": bool(self.data_is_persistently_exciting),
@@ -670,7 +704,11 @@ class DeePC:
         }
 
     def _restore_active_bank_state(self):
-        bank = self.bank_states[self._active_bank_name()]
+        self._restore_bank_state(self._active_bank_name())
+
+    def _restore_bank_state(self, bank_name):
+        bank = self.bank_states[bank_name]
+        self.health_mode = bank_name
         self.data_is_persistently_exciting = bool(bank["data_is_persistently_exciting"])
         self.u_d = self._copy_bank_array_or_list(bank["u_d"])
         self.y_d = self._copy_bank_array_or_list(bank["y_d"])
@@ -695,7 +733,10 @@ class DeePC:
         self.Y_f.value = np.asarray(bank["Y_f"], dtype=float).copy()
 
     def _capture_active_bank_state(self):
-        self.bank_states[self._active_bank_name()] = self._capture_bank_state()
+        self._capture_bank_state_to(self._active_bank_name())
+
+    def _capture_bank_state_to(self, bank_name):
+        self.bank_states[bank_name] = self._capture_bank_state()
 
     def _copy_bank_array_or_list(self, value):
         if isinstance(value, list):

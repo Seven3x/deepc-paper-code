@@ -99,6 +99,7 @@ class Simulation:
         epsilon = 1e-10 # Small value to avoid numerical errors
 
         for t in time[:-1]:
+            self.system.current_time = float(t)
             
             if t >= h*k - epsilon: # ZOH sampling
                 
@@ -132,6 +133,7 @@ class Simulation:
                         f"MeasurementSourceStep: {measurement_packet['source_step']}"
                     )
 
+            self.system.current_time = float(t)
             x = self.rk4(x, u)                 # Integrate system dynamics
             # Store data
             x_data.append(x)

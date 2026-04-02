@@ -79,6 +79,7 @@ class Quadcopter:
 
         self.measurement_config = self._normalize_measurement_config(measurement_config)
         self.fault_config = self._normalize_fault_config(fault_config)
+        self.current_time = 0.0
         self._measurement_rng = np.random.default_rng(self.measurement_config["seed"])
         self._measurement_step = 0
         self._current_yaw_bias = self.measurement_config["yaw_bias"]
@@ -238,6 +239,7 @@ class Quadcopter:
             "rotor_index": 0,
             "efficiency_scale": 1.0,
             "health_mode": "nominal",
+            "start_time": 0.0,
         }
         if fault_config is None:
             return config
@@ -246,6 +248,7 @@ class Quadcopter:
         config["rotor_index"] = int(fault_config.get("rotor_index", 0))
         config["efficiency_scale"] = float(fault_config.get("efficiency_scale", 1.0))
         config["health_mode"] = str(fault_config.get("health_mode", "nominal"))
+        config["start_time"] = float(fault_config.get("start_time", 0.0))
 
         if config["mode"] not in {"nominal", "single_rotor_efficiency_drop"}:
             raise ValueError(f"Unsupported fault mode: {config['mode']}")
@@ -267,9 +270,17 @@ class Quadcopter:
             effective_u = sp.Matrix(u_input)
         else:
             effective_u = np.asarray(u_input, dtype=float).copy()
-        if self.fault_config["mode"] == "single_rotor_efficiency_drop":
+        if self.is_fault_active() and self.fault_config["mode"] == "single_rotor_efficiency_drop":
             effective_u[self.fault_config["rotor_index"]] *= self.fault_config["efficiency_scale"]
         return effective_u
+
+    def is_fault_active(self):
+        if self.fault_config["mode"] == "nominal":
+            return False
+        return float(self.current_time) >= float(self.fault_config["start_time"])
+
+    def current_health_mode(self):
+        return "degraded" if self.is_fault_active() else "nominal"
     
     def output_constraint(self, y):
         return self.F@y <= self.f
