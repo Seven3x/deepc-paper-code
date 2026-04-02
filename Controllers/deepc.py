@@ -23,6 +23,10 @@ class DeePC:
         block_lambda_yaw=None,
         block_lambda_position=None,
         data_length_extra=0,
+        history_alignment="naive",
+        consistency_gate_lambda=3.0,
+        consistency_gate_clip=3.0,
+        consistency_gate_eps=1.0e-6,
     ):
         '''Initialize DeePC controller'''
 
@@ -48,6 +52,12 @@ class DeePC:
         self.residual_weight_floor = residual_weight_floor
         self.residual_weight_min = residual_weight_min
         self.residual_weight_max = residual_weight_max
+        self.residual_stat_summary = None
+        self.consistency_gate_summary = None
+        self.history_alignment = history_alignment
+        self.consistency_gate_lambda = consistency_gate_lambda
+        self.consistency_gate_clip = consistency_gate_clip
+        self.consistency_gate_eps = consistency_gate_eps
         self.block_lambda_roll_pitch = block_lambda_roll_pitch if block_lambda_roll_pitch is not None else lambda_y
         self.block_lambda_yaw = block_lambda_yaw if block_lambda_yaw is not None else lambda_y
         self.block_lambda_position = block_lambda_position if block_lambda_position is not None else lambda_y
@@ -56,13 +66,21 @@ class DeePC:
         if self.trajectory.has_initial_ref:
             self.trajectory.output_reference = np.hstack((self.trajectory.initial_reference(self.T),
                                                         self.trajectory.output_reference))
-        self.remaining_output_reference = self.trajectory.extend_reference(self.trajectory.output_reference, self.N)
+        self.full_output_reference = self.trajectory.output_reference.copy()
+        self.current_reference_step = 0
+        self.remaining_output_reference = self._reference_window(self.current_reference_step, self.N)
 
         # Set up QP optimization
         self.y_ini = cp.Parameter((self.p, self.T_ini))
         self.u_ini = cp.Parameter((self.m, self.T_ini))
+        self.y_ini_mask = cp.Parameter((self.p, self.T_ini), nonneg=True)
+        self.y_ini_source_steps = cp.Parameter((self.p, self.T_ini))
+        self.y_ini_timestamps = cp.Parameter((self.p, self.T_ini))
         self.y_ini.value = np.zeros((self.p, self.T_ini))
         self.u_ini.value = np.zeros((self.m, self.T_ini))
+        self.y_ini_mask.value = np.ones((self.p, self.T_ini))
+        self.y_ini_source_steps.value = -np.ones((self.p, self.T_ini))
+        self.y_ini_timestamps.value = -self.system.h * np.ones((self.p, self.T_ini))
         self.U_p = cp.Parameter((self.T_ini*self.m, self.T - self.T_ini - self.N + 1))
         self.Y_p = cp.Parameter((self.T_ini*self.p, self.T - self.T_ini - self.N + 1))
         self.U_f = cp.Parameter((self.N*self.m, self.T - self.T_ini - self.N + 1))
@@ -70,6 +88,8 @@ class DeePC:
         self.ref = cp.Parameter((self.p, self.N))
         self.ref.value = self.remaining_output_reference[:,:self.N]
         self.g_r = cp.Parameter((self.T - self.T_ini - self.N + 1, 1))
+        self.consistency_column_weights = cp.Parameter((self.T - self.T_ini - self.N + 1, 1), nonneg=True)
+        self.consistency_column_weights.value = np.zeros((self.T - self.T_ini - self.N + 1, 1))
 
         self.y = cp.Variable((self.p, self.N))
         self.u = cp.Variable((self.m, self.N))
@@ -93,6 +113,13 @@ class DeePC:
         self.u_d = []
         self.y_d = []
         self.measurement_residual_d = []
+        self.applied_inputs_by_step = {}
+        self.received_history = []
+        self.aligned_history = []
+        self.async_source_slots = {}
+        self.next_async_training_source_step = 0
+        self.latest_measurement_metadata = None
+        self.current_delay_steps = 0
 
     def construct_hankel_matrix(self, x, L):
         '''
@@ -128,8 +155,16 @@ class DeePC:
 
         self.Hpinv = np.linalg.pinv(np.vstack((self.U_p.value, self.Y_p.value, self.U_f.value, self.Y_f.value)))
 
+        # Residual-statistics modes all consume the same calibration bank that
+        # was collected before DeePC became persistently exciting.
         if self.is_regularized and self.regularization_mode == "residual_stats":
             self.sigma_y_group_weights.value = self._compute_residual_stat_weights()
+        elif self.is_regularized and self.regularization_mode == "residual_variance":
+            self.sigma_y_group_weights.value = self._compute_residual_variance_weights()
+        elif self.is_regularized and self.regularization_mode == "residual_bias_variance":
+            self.sigma_y_group_weights.value = self._compute_residual_bias_variance_weights()
+        elif self.is_regularized and self.regularization_mode == "robust_residual_stats":
+            self.sigma_y_group_weights.value = self._compute_robust_residual_stat_weights()
 
         print("Hankel matrices created and partitioned.")
 
@@ -144,7 +179,14 @@ class DeePC:
             sigma_y = np.reshape(self.sigma_y, (self.p*self.T_ini, 1), order='F')
         
         eq_con = [self.U_p @ self.g == u_ini]
-        if self.regularization_mode == "drop_yaw_past" and self.yaw_output_rows:
+        if self.history_alignment == "async_masked":
+            Y_pg = cp.reshape(self.Y_p @ self.g, (self.p, self.T_ini), order="F")
+            if self.is_regularized:
+                eq_con += [cp.multiply(self.y_ini_mask, Y_pg - self.y_ini - self.sigma_y) == 0]
+                eq_con += [cp.multiply(1.0 - self.y_ini_mask, self.sigma_y) == 0]
+            else:
+                eq_con += [cp.multiply(self.y_ini_mask, Y_pg - self.y_ini) == 0]
+        elif self.regularization_mode == "drop_yaw_past" and self.yaw_output_rows:
             Y_pg = cp.reshape(self.Y_p @ self.g, (self.p, self.T_ini), order="F")
             for row in self.non_yaw_output_rows:
                 eq_con += [Y_pg[row, :] == self.y_ini[row, :]]
@@ -186,6 +228,11 @@ class DeePC:
             else:
                 weighted_sigma_y = cp.multiply(self.sigma_y_group_weights, self.sigma_y)
                 cost += self.lambda_y*cp.norm2(weighted_sigma_y)
+
+        if self.history_alignment == "consistency_gated_time_aligned":
+            cost += self.consistency_gate_lambda * cp.sum(
+                cp.multiply(self.consistency_column_weights, cp.square(self.g))
+            )
 
         return cost
 
@@ -234,29 +281,117 @@ class DeePC:
         return weights
 
     def _compute_residual_stat_weights(self):
-        residuals = self.measurement_residual_d
+        residuals = self._measurement_residual_matrix()
         residual_rms = np.sqrt(np.mean(np.square(residuals), axis=1))
-        effective_rms = np.maximum(residual_rms, self.residual_weight_floor)
-        inv_rms = 1.0 / effective_rms
-        median_inv_rms = np.median(inv_rms)
-        weights = inv_rms / median_inv_rms
+        return self._scale_to_weights(residual_rms, residuals, residual_rms)
+
+    def _compute_residual_variance_weights(self):
+        residuals = self._measurement_residual_matrix()
+        residual_variance = np.var(residuals, axis=1)
+        residual_std = np.sqrt(np.maximum(residual_variance, 0.0))
+        return self._scale_to_weights(residual_std, residuals, residual_std)
+
+    def _compute_residual_bias_variance_weights(self):
+        residuals = self._measurement_residual_matrix()
+        residual_mean = np.mean(residuals, axis=1)
+        residual_variance = np.var(residuals, axis=1)
+        combined_scale = np.sqrt(np.square(residual_mean) + residual_variance)
+        return self._scale_to_weights(combined_scale, residuals, combined_scale)
+
+    def _compute_robust_residual_stat_weights(self):
+        residuals = self._measurement_residual_matrix()
+        residual_median = np.median(residuals, axis=1)
+        centered = residuals - residual_median[:, None]
+        mad = np.median(np.abs(centered), axis=1)
+        robust_scale = 1.4826 * mad
+        combined_scale = np.sqrt(np.square(residual_median) + np.square(robust_scale))
+        return self._scale_to_weights(combined_scale, residuals, combined_scale)
+
+    def _measurement_residual_matrix(self):
+        residuals = np.asarray(self.measurement_residual_d, dtype=float)
+        if residuals.ndim != 2:
+            raise ValueError(
+                "measurement_residual_d must be a 2D array with shape (p, T); "
+                f"got {residuals.ndim}D"
+            )
+        if residuals.shape[0] != self.p:
+            raise ValueError(
+                "measurement_residual_d has the wrong number of output rows; "
+                f"expected {self.p}, got {residuals.shape[0]}"
+            )
+        return residuals
+
+    def _scale_to_weights(self, scales, residuals=None, residual_scale=None):
+        scales = np.asarray(scales, dtype=float).reshape(self.p)
+        effective_scales = np.maximum(scales, self.residual_weight_floor)
+        inv_scales = 1.0 / effective_scales
+        median_inv_scale = np.median(inv_scales)
+        weights = inv_scales / median_inv_scale
         weights = np.clip(weights, self.residual_weight_min, self.residual_weight_max)
+        if residuals is not None:
+            residual_array = np.asarray(residuals, dtype=float)
+            self.residual_stat_summary = {
+                "mode": self.regularization_mode,
+                "num_samples": int(residual_array.shape[1]),
+                "mean_residual": np.mean(residual_array, axis=1).tolist(),
+                "std_residual": np.std(residual_array, axis=1).tolist(),
+                "residual_scale": np.asarray(residual_scale, dtype=float).reshape(self.p).tolist(),
+                "effective_scale": effective_scales.tolist(),
+                "weights": weights.tolist(),
+            }
         return weights.reshape(self.p, 1)
 
-    def compute_input(self, x_current):
-        y_current = self.system.measure_output(x_current)
-        measurement_residual = y_current - (self.system.C @ x_current)
+    def compute_input(self, x_current, y_current=None):
+        measurement_packet = self._normalize_measurement_packet(x_current, y_current)
+        delivered_y = measurement_packet["output"]
+        measurement_residual = measurement_packet["output_mask"] * (
+            delivered_y - measurement_packet["true_output"]
+        )
+
+        if (
+            self.history_alignment in {"time_aligned", "suffix_aligned", "consistency_gated_time_aligned"}
+            and self.data_is_persistently_exciting
+            and measurement_packet["source_step"] < measurement_packet["delivered_step"]
+            and measurement_packet["source_step"] in self.applied_inputs_by_step
+        ):
+            aligned_pair = self._build_history_pair(
+                pair_input=self.applied_inputs_by_step[measurement_packet["source_step"]],
+                pair_step=measurement_packet["source_step"],
+                measurement_packet=measurement_packet,
+                measurement_residual=measurement_residual,
+            )
+            self.aligned_history.append(aligned_pair)
+            self._refresh_ini_windows()
+        elif (
+            self.history_alignment == "async_masked"
+            and self.data_is_persistently_exciting
+            and self._effective_reference_step(measurement_packet) < measurement_packet["delivered_step"]
+        ):
+            self._update_async_source_slots(measurement_packet, measurement_residual)
+            self._refresh_ini_windows()
 
         if self.data_is_persistently_exciting:
-            u_optimal = self.compute_optimal_control()
+            if self.history_alignment in {"time_aligned", "delay_ref_only", "suffix_aligned", "consistency_gated_time_aligned"}:
+                optimization_reference_step = measurement_packet["source_step"]
+                control_offset = measurement_packet["delay_steps"]
+            elif self.history_alignment == "async_masked":
+                optimization_reference_step = self._effective_reference_step(measurement_packet)
+                control_offset = max(0, measurement_packet["delivered_step"] - optimization_reference_step)
+            else:
+                optimization_reference_step = measurement_packet["delivered_step"]
+                control_offset = 0
+
+            self.ref.value = self._reference_window(optimization_reference_step, self.N)
+            self._update_consistency_gate_weights()
+            u_optimal = self.compute_optimal_control(control_offset=control_offset)
         else:
             u_optimal = self.initial_controller.compute_input(x_current, self.ref.value[:,0])
-            
-        self.collect_and_update(y_current, u_optimal, measurement_residual)
+
+        self.collect_and_update(measurement_packet, u_optimal, measurement_residual)
 
         return u_optimal
     
-    def compute_optimal_control(self):
+    def compute_optimal_control(self, control_offset=0):
         solve_kwargs = {
             "verbose": False,
             "ignore_dpp": True,
@@ -265,31 +400,48 @@ class DeePC:
             solve_kwargs["solver"] = self.solver
 
         self.problem.solve(**solve_kwargs)
-        u_optimal = self.u[:, 0].value
+        control_index = min(max(int(control_offset), 0), self.N - 1)
+        u_optimal = self.u[:, control_index].value
 
         return u_optimal
 
-    def collect_and_update(self, y_current, u_optimal, measurement_residual):
-        self.y_ini.value[:,:-1] = self.y_ini.value[:,1:]
-        self.u_ini.value[:,:-1] = self.u_ini.value[:,1:]
+    def collect_and_update(self, measurement_packet, u_optimal, measurement_residual):
+        delivered_step = int(measurement_packet["delivered_step"])
+        source_step = int(measurement_packet["source_step"])
+        self.applied_inputs_by_step[delivered_step] = np.asarray(u_optimal, dtype=float).reshape(-1)
+        received_pair = self._build_history_pair(
+            pair_input=np.asarray(u_optimal, dtype=float).reshape(-1),
+            pair_step=delivered_step,
+            measurement_packet=measurement_packet,
+            measurement_residual=measurement_residual,
+        )
+        self.received_history.append(received_pair)
 
-        self.y_ini.value[:,-1] = y_current
-        self.u_ini.value[:,-1] = u_optimal
+        training_pair = None
+        if self.history_alignment in {"time_aligned", "consistency_gated_time_aligned"}:
+            if source_step in self.applied_inputs_by_step:
+                training_pair = self._build_history_pair(
+                    pair_input=self.applied_inputs_by_step[source_step],
+                    pair_step=source_step,
+                    measurement_packet=measurement_packet,
+                    measurement_residual=measurement_residual,
+                )
+        elif self.history_alignment == "async_masked":
+            self._update_async_source_slots(measurement_packet, measurement_residual)
+            self._update_async_source_slot_inputs(
+                source_step=source_step,
+                fallback_input=np.asarray(u_optimal, dtype=float).reshape(-1),
+            )
+            self._append_async_training_pairs()
+        elif self.history_alignment == "suffix_aligned":
+            training_pair = received_pair
+        else:
+            training_pair = received_pair
 
+        self._append_training_pair(training_pair)
+        self._refresh_ini_windows()
         # Update the reference trajectory.
         self.shift_reference()
-
-        if not self.data_is_persistently_exciting:
-            self.u_d.append(u_optimal)
-            self.y_d.append(y_current)
-            self.measurement_residual_d.append(measurement_residual)
-
-            if len(self.u_d) == self.T:
-                self.u_d = np.array(self.u_d).T
-                self.y_d = np.array(self.y_d).T
-                self.measurement_residual_d = np.array(self.measurement_residual_d).T
-                self.create_and_partition_hankel_matrices()
-                self.data_is_persistently_exciting = self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
         
         if self.data_is_persistently_exciting:
             # Update steady state solution g_r 
@@ -302,8 +454,253 @@ class DeePC:
             self.g_r.value = self.Hpinv @ uy_r
 
     def shift_reference(self):
-        self.remaining_output_reference = self.trajectory.extend_reference(self.remaining_output_reference[:,1:], self.N)
-        self.ref.value = self.remaining_output_reference[:,:self.N]
+        self.current_reference_step += 1
+        self.remaining_output_reference = self._reference_window(self.current_reference_step, self.N)
+        self.ref.value = self.remaining_output_reference[:, :self.N]
+
+    def _reference_window(self, start_step, horizon):
+        start_step = max(int(start_step), 0)
+        ref = self.full_output_reference[:, start_step:start_step + horizon]
+        return self.trajectory.extend_reference(ref, horizon)
+
+    def _build_history_pair(self, pair_input, pair_step, measurement_packet, measurement_residual):
+        return {
+            "u": np.asarray(pair_input, dtype=float).reshape(self.m),
+            "y": np.asarray(measurement_packet["output"], dtype=float).reshape(self.p),
+            "mask": np.asarray(measurement_packet["output_mask"], dtype=float).reshape(self.p),
+            "source_steps": np.asarray(measurement_packet["output_source_steps"], dtype=float).reshape(self.p),
+            "timestamps": np.asarray(measurement_packet["output_timestamps"], dtype=float).reshape(self.p),
+            "measurement_residual": np.asarray(measurement_residual, dtype=float).reshape(self.p),
+            "pair_step": int(pair_step),
+            "source_step": int(measurement_packet["source_step"]),
+            "delivered_step": int(measurement_packet["delivered_step"]),
+        }
+
+    def _normalize_measurement_packet(self, x_current, y_current):
+        if y_current is None:
+            delivered_y = self.system.measure_output(x_current)
+            true_y = self.system.C @ x_current
+            packet = {
+                "output": delivered_y,
+                "true_output": true_y,
+                "source_step": len(self.applied_inputs_by_step),
+                "delivered_step": len(self.applied_inputs_by_step),
+                "delay_steps": 0,
+            }
+        elif isinstance(y_current, dict):
+            packet = dict(y_current)
+        else:
+            delivered_y = np.asarray(y_current, dtype=float)
+            true_y = self.system.C @ x_current
+            packet = {
+                "output": delivered_y,
+                "true_output": true_y,
+                "source_step": len(self.applied_inputs_by_step),
+                "delivered_step": len(self.applied_inputs_by_step),
+                "delay_steps": 0,
+            }
+
+        packet["output"] = np.asarray(packet["output"], dtype=float).reshape(self.p)
+        packet["true_output"] = np.asarray(packet["true_output"], dtype=float).reshape(self.p)
+        packet["source_step"] = int(packet.get("source_step", packet.get("delivered_step", len(self.applied_inputs_by_step))))
+        packet["target_source_step"] = int(packet.get("target_source_step", packet["source_step"]))
+        packet["delivered_step"] = int(packet.get("delivered_step", packet["source_step"]))
+        packet["delay_steps"] = int(packet.get("delay_steps", max(0, packet["delivered_step"] - packet["source_step"])))
+        packet["output_mask"] = np.asarray(packet.get("output_mask", np.ones(self.p)), dtype=float).reshape(self.p)
+        packet["output_source_steps"] = np.asarray(
+            packet.get("output_source_steps", np.full(self.p, packet["source_step"])),
+            dtype=float,
+        ).reshape(self.p)
+        packet["output_timestamps"] = np.asarray(
+            packet.get("output_timestamps", packet["output_source_steps"] * self.system.h),
+            dtype=float,
+        ).reshape(self.p)
+        self.current_delay_steps = packet["delay_steps"]
+        self.latest_measurement_metadata = {
+            "source_step": packet["source_step"],
+            "target_source_step": packet["target_source_step"],
+            "delivered_step": packet["delivered_step"],
+            "delay_steps": packet["delay_steps"],
+            "output_mask": packet["output_mask"].tolist(),
+            "output_source_steps": packet["output_source_steps"].astype(int).tolist(),
+            "output_timestamps": packet["output_timestamps"].tolist(),
+            "effective_reference_step": int(self._effective_reference_step(packet)),
+        }
+        return packet
+
+    def _refresh_ini_windows(self):
+        self.y_ini.value[:, :] = 0.0
+        self.u_ini.value[:, :] = 0.0
+        self.y_ini_mask.value[:, :] = 0.0
+        self.y_ini_source_steps.value[:, :] = -1.0
+        self.y_ini_timestamps.value[:, :] = -self.system.h
+        history_window = self._history_window()
+        if not history_window:
+            return
+
+        start_col = self.T_ini - len(history_window)
+        for col, pair in enumerate(history_window, start=start_col):
+            self.u_ini.value[:, col] = pair["u"]
+            self.y_ini.value[:, col] = pair["y"]
+            self.y_ini_mask.value[:, col] = pair["mask"]
+            self.y_ini_source_steps.value[:, col] = pair["source_steps"]
+            self.y_ini_timestamps.value[:, col] = pair["timestamps"]
+
+    def _history_window(self):
+        if self.history_alignment == "async_masked":
+            if not self.async_source_slots:
+                return []
+            latest_source_step = max(self.async_source_slots)
+            start_step = max(0, latest_source_step - self.T_ini + 1)
+            return [
+                self.async_source_slots[source_step]
+                for source_step in range(start_step, latest_source_step + 1)
+                if source_step in self.async_source_slots
+            ]
+
+        if self.history_alignment in {"time_aligned", "consistency_gated_time_aligned"}:
+            return self.aligned_history[-self.T_ini:]
+
+        if self.history_alignment == "suffix_aligned":
+            delay_steps = min(max(int(self.current_delay_steps), 0), self.T_ini)
+            prefix_len = self.T_ini - delay_steps
+            if delay_steps == 0:
+                return self.received_history[-self.T_ini:]
+
+            prefix = self.received_history[-(prefix_len + delay_steps):-delay_steps]
+            suffix = self.aligned_history[-delay_steps:]
+            return prefix + suffix
+
+        return self.received_history[-self.T_ini:]
+
+    def _effective_reference_step(self, measurement_packet):
+        if self.history_alignment != "async_masked":
+            return int(measurement_packet["source_step"])
+
+        observed = np.asarray(measurement_packet["output_mask"], dtype=float).reshape(self.p) > 0.5
+        source_steps = np.asarray(measurement_packet["output_source_steps"], dtype=float).reshape(self.p)
+        if np.any(observed):
+            return int(np.max(source_steps[observed]))
+        return int(np.max(source_steps))
+
+    def _update_consistency_gate_weights(self):
+        self.consistency_column_weights.value[:, :] = 0.0
+        if self.history_alignment != "consistency_gated_time_aligned":
+            return
+        if self.Y_p.value is None:
+            return
+
+        y_ini_vector = self.y_ini.value.reshape(self.p * self.T_ini, 1, order="F")
+        diffs = self.Y_p.value - y_ini_vector
+        scores = np.linalg.norm(diffs, axis=0)
+        score_median = float(np.median(scores))
+        mad = float(np.median(np.abs(scores - score_median)))
+        normalized_scores = (scores - score_median) / (mad + self.consistency_gate_eps)
+        weights = np.clip(normalized_scores, 0.0, self.consistency_gate_clip)
+        self.consistency_column_weights.value = weights.reshape(-1, 1)
+        self.consistency_gate_summary = {
+            "mode": self.history_alignment,
+            "lambda_c": float(self.consistency_gate_lambda),
+            "clip": float(self.consistency_gate_clip),
+            "eps": float(self.consistency_gate_eps),
+            "score_median": score_median,
+            "score_mad": mad,
+            "weight_min": float(np.min(weights)) if weights.size else 0.0,
+            "weight_max": float(np.max(weights)) if weights.size else 0.0,
+            "weight_mean": float(np.mean(weights)) if weights.size else 0.0,
+        }
+
+    def _append_training_pair(self, pair):
+        if pair is None or self.data_is_persistently_exciting:
+            return
+
+        self.u_d.append(pair["u"])
+        self.y_d.append(pair["y"])
+        self.measurement_residual_d.append(pair["measurement_residual"])
+
+        if len(self.u_d) == self.T:
+            self.u_d = np.array(self.u_d).T
+            self.y_d = np.array(self.y_d).T
+            self.measurement_residual_d = np.array(self.measurement_residual_d).T
+            self.create_and_partition_hankel_matrices()
+            self.data_is_persistently_exciting = self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
+
+    def _make_async_source_slot(self, source_step):
+        previous_slot = self.async_source_slots.get(source_step - 1)
+        if previous_slot is None:
+            y = np.zeros(self.p)
+            source_steps = -np.ones(self.p)
+            timestamps = -self.system.h * np.ones(self.p)
+        else:
+            y = previous_slot["y"].copy()
+            source_steps = previous_slot["source_steps"].copy()
+            timestamps = previous_slot["timestamps"].copy()
+
+        return {
+            "u": None,
+            "y": y,
+            "mask": np.zeros(self.p),
+            "source_steps": source_steps,
+            "timestamps": timestamps,
+            "measurement_residual": np.zeros(self.p),
+            "pair_step": int(source_step),
+            "source_step": int(source_step),
+            "delivered_step": int(source_step),
+        }
+
+    def _update_async_source_slots(self, measurement_packet, measurement_residual):
+        output_source_steps = np.asarray(measurement_packet["output_source_steps"], dtype=int).reshape(self.p)
+        output_mask = np.asarray(measurement_packet["output_mask"], dtype=float).reshape(self.p)
+        output_timestamps = np.asarray(measurement_packet["output_timestamps"], dtype=float).reshape(self.p)
+        delivered_output = np.asarray(measurement_packet["output"], dtype=float).reshape(self.p)
+        measurement_residual = np.asarray(measurement_residual, dtype=float).reshape(self.p)
+        delivered_step = int(measurement_packet["delivered_step"])
+        target_source_step = int(measurement_packet.get("target_source_step", measurement_packet["source_step"]))
+
+        unique_source_steps = sorted({int(step) for step in output_source_steps if step >= 0})
+        if target_source_step >= 0:
+            unique_source_steps = sorted(set(unique_source_steps + [target_source_step]))
+        for source_step in unique_source_steps:
+            if source_step not in self.async_source_slots:
+                self.async_source_slots[source_step] = self._make_async_source_slot(source_step)
+
+            slot = self.async_source_slots[source_step]
+            slot["delivered_step"] = delivered_step
+            for row in range(self.p):
+                if output_mask[row] < 0.5:
+                    continue
+                if int(output_source_steps[row]) != source_step:
+                    continue
+                slot["y"][row] = delivered_output[row]
+                slot["mask"][row] = 1.0
+                slot["source_steps"][row] = float(output_source_steps[row])
+                slot["timestamps"][row] = output_timestamps[row]
+                slot["measurement_residual"][row] = measurement_residual[row]
+
+        self._update_async_source_slot_inputs()
+
+    def _update_async_source_slot_inputs(self, source_step=None, fallback_input=None):
+        if source_step is not None and source_step in self.async_source_slots:
+            slot = self.async_source_slots[source_step]
+            if source_step in self.applied_inputs_by_step:
+                slot["u"] = np.asarray(self.applied_inputs_by_step[source_step], dtype=float).reshape(self.m)
+            elif fallback_input is not None:
+                slot["u"] = np.asarray(fallback_input, dtype=float).reshape(self.m)
+
+        for tracked_source_step, slot in self.async_source_slots.items():
+            if slot["u"] is None and tracked_source_step in self.applied_inputs_by_step:
+                slot["u"] = np.asarray(self.applied_inputs_by_step[tracked_source_step], dtype=float).reshape(self.m)
+
+    def _append_async_training_pairs(self):
+        while not self.data_is_persistently_exciting:
+            source_step = self.next_async_training_source_step
+            if source_step not in self.async_source_slots:
+                break
+            slot = self.async_source_slots[source_step]
+            if slot["u"] is None:
+                break
+            self._append_training_pair(slot)
+            self.next_async_training_source_step += 1
         
     def is_persistently_excited_of_order_L(self, x, L):
         H = self.construct_hankel_matrix(x, L)

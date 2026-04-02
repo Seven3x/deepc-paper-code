@@ -190,6 +190,10 @@ class Quadcopter:
             "yaw_bias": 0.0,
             "yaw_drift_per_sec": 0.0,
             "seed": 0,
+            "delay_steps": 0,
+            "async_period_steps": np.ones(self.p, dtype=int),
+            "burst_dropout_rate": 0.0,
+            "burst_dropout_length": 0,
         }
         if measurement_config is None:
             return config
@@ -197,6 +201,9 @@ class Quadcopter:
         config["yaw_bias"] = float(measurement_config.get("yaw_bias", 0.0))
         config["yaw_drift_per_sec"] = float(measurement_config.get("yaw_drift_per_sec", 0.0))
         config["seed"] = int(measurement_config.get("seed", 0))
+        config["delay_steps"] = int(measurement_config.get("delay_steps", 0))
+        config["burst_dropout_rate"] = float(measurement_config.get("burst_dropout_rate", 0.0))
+        config["burst_dropout_length"] = int(measurement_config.get("burst_dropout_length", 0))
 
         noise_std = measurement_config.get("noise_std", 0.0)
         if np.isscalar(noise_std):
@@ -206,6 +213,20 @@ class Quadcopter:
             if noise_std.shape != (self.p,):
                 raise ValueError(f"measurement noise_std must have shape ({self.p},), got {noise_std.shape}")
             config["noise_std"] = noise_std
+
+        async_period_steps = measurement_config.get("async_period_steps", np.ones(self.p, dtype=int))
+        async_period_steps = np.asarray(async_period_steps, dtype=int).reshape(-1)
+        if async_period_steps.size == 1:
+            async_period_steps = np.repeat(async_period_steps, self.p)
+        elif self.output_set == "xyz" and async_period_steps.size == 6:
+            async_period_steps = async_period_steps[3:]
+        elif async_period_steps.size != self.p:
+            raise ValueError(
+                f"measurement async_period_steps must have shape ({self.p},) or be scalar, got {async_period_steps.shape}"
+            )
+        if np.any(async_period_steps <= 0):
+            raise ValueError("measurement async_period_steps must be strictly positive")
+        config["async_period_steps"] = async_period_steps
 
         return config
     
