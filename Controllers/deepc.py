@@ -36,7 +36,7 @@ class DeePC:
         self.n = system.n
         self.m = system.m
         self.p = system.p
-        self.bank_mode = "single_bank"
+        self.bank_mode = "dual_bank"
         self.health_mode = getattr(system, "fault_config", {}).get("health_mode", "nominal")
         self.yaw_output_rows = [row for row, idx in enumerate(system.output_indices) if idx == 2]
         self.non_yaw_output_rows = [row for row in range(self.p) if row not in self.yaw_output_rows]
@@ -92,6 +92,10 @@ class DeePC:
         self.g_r = cp.Parameter((self.T - self.T_ini - self.N + 1, 1))
         self.consistency_column_weights = cp.Parameter((self.T - self.T_ini - self.N + 1, 1), nonneg=True)
         self.consistency_column_weights.value = np.zeros((self.T - self.T_ini - self.N + 1, 1))
+        self.U_p.value = np.zeros((self.T_ini * self.m, self.T - self.T_ini - self.N + 1))
+        self.Y_p.value = np.zeros((self.T_ini * self.p, self.T - self.T_ini - self.N + 1))
+        self.U_f.value = np.zeros((self.N * self.m, self.T - self.T_ini - self.N + 1))
+        self.Y_f.value = np.zeros((self.N * self.p, self.T - self.T_ini - self.N + 1))
 
         self.y = cp.Variable((self.p, self.N))
         self.u = cp.Variable((self.m, self.N))
@@ -122,6 +126,12 @@ class DeePC:
         self.next_async_training_source_step = 0
         self.latest_measurement_metadata = None
         self.current_delay_steps = 0
+        self.Hpinv = None
+        self.bank_mode = "dual_bank"
+        self.bank_states = {
+            "nominal": self._capture_bank_state(),
+            "degraded": self._capture_bank_state(),
+        }
 
     def construct_hankel_matrix(self, x, L):
         '''
@@ -344,6 +354,7 @@ class DeePC:
         return weights.reshape(self.p, 1)
 
     def compute_input(self, x_current, y_current=None):
+        self._restore_active_bank_state()
         measurement_packet = self._normalize_measurement_packet(x_current, y_current)
         delivered_y = measurement_packet["output"]
         measurement_residual = measurement_packet["output_mask"] * (
@@ -390,6 +401,7 @@ class DeePC:
             u_optimal = self.initial_controller.compute_input(x_current, self.ref.value[:,0])
 
         self.collect_and_update(measurement_packet, u_optimal, measurement_residual)
+        self._capture_active_bank_state()
 
         return u_optimal
     
@@ -626,6 +638,81 @@ class DeePC:
             self.measurement_residual_d = np.array(self.measurement_residual_d).T
             self.create_and_partition_hankel_matrices()
             self.data_is_persistently_exciting = self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
+
+    def _active_bank_name(self):
+        requested = getattr(self, "health_mode", "nominal")
+        return requested if requested in self.bank_states else "nominal"
+
+    def _capture_bank_state(self):
+        return {
+            "data_is_persistently_exciting": bool(self.data_is_persistently_exciting),
+            "u_d": self._copy_bank_array_or_list(self.u_d),
+            "y_d": self._copy_bank_array_or_list(self.y_d),
+            "measurement_residual_d": self._copy_bank_array_or_list(self.measurement_residual_d),
+            "applied_inputs_by_step": {
+                int(step): np.asarray(value, dtype=float).copy()
+                for step, value in self.applied_inputs_by_step.items()
+            },
+            "received_history": self._copy_history(self.received_history),
+            "aligned_history": self._copy_history(self.aligned_history),
+            "async_source_slots": {
+                int(step): self._copy_history_pair(pair)
+                for step, pair in self.async_source_slots.items()
+            },
+            "next_async_training_source_step": int(self.next_async_training_source_step),
+            "latest_measurement_metadata": None if self.latest_measurement_metadata is None else dict(self.latest_measurement_metadata),
+            "current_delay_steps": int(self.current_delay_steps),
+            "Hpinv": None if self.Hpinv is None else np.asarray(self.Hpinv, dtype=float).copy(),
+            "U_p": np.asarray(self.U_p.value, dtype=float).copy(),
+            "Y_p": np.asarray(self.Y_p.value, dtype=float).copy(),
+            "U_f": np.asarray(self.U_f.value, dtype=float).copy(),
+            "Y_f": np.asarray(self.Y_f.value, dtype=float).copy(),
+        }
+
+    def _restore_active_bank_state(self):
+        bank = self.bank_states[self._active_bank_name()]
+        self.data_is_persistently_exciting = bool(bank["data_is_persistently_exciting"])
+        self.u_d = self._copy_bank_array_or_list(bank["u_d"])
+        self.y_d = self._copy_bank_array_or_list(bank["y_d"])
+        self.measurement_residual_d = self._copy_bank_array_or_list(bank["measurement_residual_d"])
+        self.applied_inputs_by_step = {
+            int(step): np.asarray(value, dtype=float).copy()
+            for step, value in bank["applied_inputs_by_step"].items()
+        }
+        self.received_history = self._copy_history(bank["received_history"])
+        self.aligned_history = self._copy_history(bank["aligned_history"])
+        self.async_source_slots = {
+            int(step): self._copy_history_pair(pair)
+            for step, pair in bank["async_source_slots"].items()
+        }
+        self.next_async_training_source_step = int(bank["next_async_training_source_step"])
+        self.latest_measurement_metadata = None if bank["latest_measurement_metadata"] is None else dict(bank["latest_measurement_metadata"])
+        self.current_delay_steps = int(bank["current_delay_steps"])
+        self.Hpinv = None if bank["Hpinv"] is None else np.asarray(bank["Hpinv"], dtype=float).copy()
+        self.U_p.value = np.asarray(bank["U_p"], dtype=float).copy()
+        self.Y_p.value = np.asarray(bank["Y_p"], dtype=float).copy()
+        self.U_f.value = np.asarray(bank["U_f"], dtype=float).copy()
+        self.Y_f.value = np.asarray(bank["Y_f"], dtype=float).copy()
+
+    def _capture_active_bank_state(self):
+        self.bank_states[self._active_bank_name()] = self._capture_bank_state()
+
+    def _copy_bank_array_or_list(self, value):
+        if isinstance(value, list):
+            return [np.asarray(item, dtype=float).copy() for item in value]
+        return np.asarray(value, dtype=float).copy()
+
+    def _copy_history_pair(self, pair):
+        copied = {}
+        for key, value in pair.items():
+            if isinstance(value, np.ndarray):
+                copied[key] = value.copy()
+            else:
+                copied[key] = value
+        return copied
+
+    def _copy_history(self, history):
+        return [self._copy_history_pair(pair) for pair in history]
 
     def _make_async_source_slot(self, source_step):
         previous_slot = self.async_source_slots.get(source_step - 1)
