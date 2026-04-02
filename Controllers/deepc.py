@@ -36,6 +36,8 @@ class DeePC:
         self.n = system.n
         self.m = system.m
         self.p = system.p
+        self.bank_mode = "single_bank"
+        self.health_mode = getattr(system, "fault_config", {}).get("health_mode", "nominal")
         self.yaw_output_rows = [row for row, idx in enumerate(system.output_indices) if idx == 2]
         self.non_yaw_output_rows = [row for row in range(self.p) if row not in self.yaw_output_rows]
 

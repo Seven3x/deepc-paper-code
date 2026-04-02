@@ -5,7 +5,7 @@ from scipy.integrate import quad_vec, quad
 import control
 
 class Quadcopter:
-    def __init__(self, h, measurement_config=None, output_set="xyzpsi"):
+    def __init__(self, h, measurement_config=None, output_set="xyzpsi", fault_config=None):
         self.n = 12
         self.m = 4
         self.h = h #ZOH sampling time
@@ -78,6 +78,7 @@ class Quadcopter:
         self.R = 1*np.eye(self.m)
 
         self.measurement_config = self._normalize_measurement_config(measurement_config)
+        self.fault_config = self._normalize_fault_config(fault_config)
         self._measurement_rng = np.random.default_rng(self.measurement_config["seed"])
         self._measurement_step = 0
         self._current_yaw_bias = self.measurement_config["yaw_bias"]
@@ -97,6 +98,7 @@ class Quadcopter:
             xdot (12x1 np.ndarray): Time derivative of the state vector
         '''
 
+        u_input = self._apply_actuator_degradation(u_input, symbolic=symbolic)
         u_input = u_input * self.max_thrust # Scale input from 0-1 to thrust
 
         Phi, Theta, Psi, p, q, r, u, v, w, _, _, _ = x
@@ -229,6 +231,45 @@ class Quadcopter:
         config["async_period_steps"] = async_period_steps
 
         return config
+
+    def _normalize_fault_config(self, fault_config):
+        config = {
+            "mode": "nominal",
+            "rotor_index": 0,
+            "efficiency_scale": 1.0,
+            "health_mode": "nominal",
+        }
+        if fault_config is None:
+            return config
+
+        config["mode"] = str(fault_config.get("mode", "nominal"))
+        config["rotor_index"] = int(fault_config.get("rotor_index", 0))
+        config["efficiency_scale"] = float(fault_config.get("efficiency_scale", 1.0))
+        config["health_mode"] = str(fault_config.get("health_mode", "nominal"))
+
+        if config["mode"] not in {"nominal", "single_rotor_efficiency_drop"}:
+            raise ValueError(f"Unsupported fault mode: {config['mode']}")
+        if not 0 <= config["rotor_index"] < self.m:
+            raise ValueError(f"fault rotor_index must be in [0, {self.m - 1}]")
+        if not 0.0 < config["efficiency_scale"] <= 1.0:
+            raise ValueError("fault efficiency_scale must be in (0, 1]")
+        if config["health_mode"] not in {"nominal", "degraded"}:
+            raise ValueError("fault health_mode must be nominal or degraded")
+
+        if config["mode"] == "nominal":
+            config["health_mode"] = "nominal"
+            config["efficiency_scale"] = 1.0
+
+        return config
+
+    def _apply_actuator_degradation(self, u_input, symbolic=False):
+        if symbolic:
+            effective_u = sp.Matrix(u_input)
+        else:
+            effective_u = np.asarray(u_input, dtype=float).copy()
+        if self.fault_config["mode"] == "single_rotor_efficiency_drop":
+            effective_u[self.fault_config["rotor_index"]] *= self.fault_config["efficiency_scale"]
+        return effective_u
     
     def output_constraint(self, y):
         return self.F@y <= self.f

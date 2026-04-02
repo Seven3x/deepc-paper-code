@@ -48,6 +48,15 @@ def build_measurement_config(args):
     }
 
 
+def build_fault_config(args):
+    return {
+        "mode": args.fault_mode,
+        "rotor_index": args.fault_rotor_index,
+        "efficiency_scale": args.fault_efficiency_scale,
+        "health_mode": args.deepc_health_mode,
+    }
+
+
 def serialize_measurement_config(config):
     noise_std = config["noise_std"]
     if isinstance(noise_std, np.ndarray):
@@ -61,6 +70,15 @@ def serialize_measurement_config(config):
         "async_period_steps": [int(item) for item in config.get("async_period_steps", [])],
         "burst_dropout_rate": float(config.get("burst_dropout_rate", 0.0)),
         "burst_dropout_length": int(config.get("burst_dropout_length", 0)),
+    }
+
+
+def serialize_fault_config(config):
+    return {
+        "mode": str(config["mode"]),
+        "rotor_index": int(config["rotor_index"]),
+        "efficiency_scale": float(config["efficiency_scale"]),
+        "health_mode": str(config["health_mode"]),
     }
 
 
@@ -200,11 +218,13 @@ def compute_metrics(result, trajectory, system):
 def run_single_experiment(args):
     ensure_output_dirs()
     measurement_config = build_measurement_config(args)
+    fault_config = build_fault_config(args)
 
     system = Quadcopter(
         h=args.sampling_time,
         measurement_config=measurement_config,
         output_set=args.output_set,
+        fault_config=fault_config,
     )
     has_initial_ref = args.controller == "deepc"
     trajectory = TrajectoryGenerator(
@@ -248,6 +268,7 @@ def run_single_experiment(args):
         "regularized": args.controller != "deepc" or not args.disable_regularization,
         "metrics": metrics,
         "measurement": serialize_measurement_config(measurement_config),
+        "fault": serialize_fault_config(fault_config),
     }
 
     if args.controller == "deepc":
@@ -279,6 +300,8 @@ def run_single_experiment(args):
             "consistency_gate_summary": controller.consistency_gate_summary,
             "data_length_T": int(controller.T),
             "latest_measurement_metadata": controller.latest_measurement_metadata,
+            "bank_mode": getattr(controller, "bank_mode", "single_bank"),
+            "health_mode": getattr(controller, "health_mode", fault_config["health_mode"]),
         }
     if args.controller == "mpc":
         output["mpc"] = {
@@ -354,6 +377,10 @@ def build_parser():
     parser.add_argument("--deepc-consistency-gate-lambda", type=float, default=3.0)
     parser.add_argument("--deepc-consistency-gate-clip", type=float, default=3.0)
     parser.add_argument("--deepc-consistency-gate-eps", type=float, default=1.0e-6)
+    parser.add_argument("--fault-mode", choices=["nominal", "single_rotor_efficiency_drop"], default="nominal")
+    parser.add_argument("--fault-rotor-index", type=int, default=0)
+    parser.add_argument("--fault-efficiency-scale", type=float, default=1.0)
+    parser.add_argument("--deepc-health-mode", choices=["nominal", "degraded"], default="nominal")
     return parser
 
 
