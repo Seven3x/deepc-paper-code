@@ -28,6 +28,7 @@ class DeePC:
         consistency_gate_clip=3.0,
         consistency_gate_eps=1.0e-6,
         controller_health_mode="nominal",
+        bank_selection_mode="fixed",
     ):
         '''Initialize DeePC controller'''
 
@@ -41,11 +42,16 @@ class DeePC:
         self.controller_health_mode = str(controller_health_mode)
         if self.controller_health_mode not in {"nominal", "degraded"}:
             raise ValueError("controller_health_mode must be nominal or degraded")
+        self.bank_selection_mode = str(bank_selection_mode)
+        if self.bank_selection_mode not in {"fixed", "oracle_minimal"}:
+            raise ValueError("bank_selection_mode must be fixed or oracle_minimal")
         self.health_mode = self.controller_health_mode
         self.plant_health_mode = "nominal"
         self.requested_bank_name = self.controller_health_mode
         self.control_bank_name = self.controller_health_mode
         self.training_bank_name = self.controller_health_mode
+        self.candidate_bank_scores = {}
+        self.degraded_bank_bootstrapped = False
         self.yaw_output_rows = [row for row, idx in enumerate(system.output_indices) if idx == 2]
         self.non_yaw_output_rows = [row for row in range(self.p) if row not in self.yaw_output_rows]
 
@@ -363,55 +369,27 @@ class DeePC:
 
     def compute_input(self, x_current, y_current=None):
         self.plant_health_mode = self._plant_health_mode()
-        desired_health_mode = self._desired_health_mode()
-        control_bank = self._select_control_bank(desired_health_mode)
-        self.requested_bank_name = desired_health_mode
-        self.control_bank_name = control_bank
-        self._restore_bank_state(control_bank)
         measurement_packet = self._normalize_measurement_packet(x_current, y_current)
         delivered_y = measurement_packet["output"]
         measurement_residual = measurement_packet["output_mask"] * (
             delivered_y - measurement_packet["true_output"]
         )
-
-        if (
-            self.history_alignment in {"time_aligned", "suffix_aligned", "consistency_gated_time_aligned"}
-            and self.data_is_persistently_exciting
-            and measurement_packet["source_step"] < measurement_packet["delivered_step"]
-            and measurement_packet["source_step"] in self.applied_inputs_by_step
-        ):
-            aligned_pair = self._build_history_pair(
-                pair_input=self.applied_inputs_by_step[measurement_packet["source_step"]],
-                pair_step=measurement_packet["source_step"],
-                measurement_packet=measurement_packet,
-                measurement_residual=measurement_residual,
-            )
-            self.aligned_history.append(aligned_pair)
-            self._refresh_ini_windows()
-        elif (
-            self.history_alignment == "async_masked"
-            and self.data_is_persistently_exciting
-            and self._effective_reference_step(measurement_packet) < measurement_packet["delivered_step"]
-        ):
-            self._update_async_source_slots(measurement_packet, measurement_residual)
-            self._refresh_ini_windows()
-
-        if self.data_is_persistently_exciting:
-            if self.history_alignment in {"time_aligned", "delay_ref_only", "suffix_aligned", "consistency_gated_time_aligned"}:
-                optimization_reference_step = measurement_packet["source_step"]
-                control_offset = measurement_packet["delay_steps"]
-            elif self.history_alignment == "async_masked":
-                optimization_reference_step = self._effective_reference_step(measurement_packet)
-                control_offset = max(0, measurement_packet["delivered_step"] - optimization_reference_step)
-            else:
-                optimization_reference_step = measurement_packet["delivered_step"]
-                control_offset = 0
-
-            self.ref.value = self._reference_window(optimization_reference_step, self.N)
-            self._update_consistency_gate_weights()
-            u_optimal = self.compute_optimal_control(control_offset=control_offset)
-        else:
-            u_optimal = self.initial_controller.compute_input(x_current, self.ref.value[:,0])
+        desired_health_mode = self._desired_health_mode()
+        self._bootstrap_degraded_bank_if_needed(desired_health_mode)
+        control_bank = self._select_control_bank(
+            desired_health_mode,
+            x_current=x_current,
+            measurement_packet=measurement_packet,
+            measurement_residual=measurement_residual,
+        )
+        self.requested_bank_name = desired_health_mode
+        self.control_bank_name = control_bank
+        self._restore_bank_state(control_bank)
+        u_optimal, _ = self._compute_control_candidate_for_active_bank(
+            x_current,
+            measurement_packet,
+            measurement_residual,
+        )
 
         self._restore_bank_state(desired_health_mode)
         self.health_mode = desired_health_mode
@@ -434,6 +412,53 @@ class DeePC:
         u_optimal = self.u[:, control_index].value
 
         return u_optimal
+
+    def _prepare_active_bank_for_measurement(self, measurement_packet, measurement_residual):
+        if (
+            self.history_alignment in {"time_aligned", "suffix_aligned", "consistency_gated_time_aligned"}
+            and self.data_is_persistently_exciting
+            and measurement_packet["source_step"] < measurement_packet["delivered_step"]
+            and measurement_packet["source_step"] in self.applied_inputs_by_step
+        ):
+            aligned_pair = self._build_history_pair(
+                pair_input=self.applied_inputs_by_step[measurement_packet["source_step"]],
+                pair_step=measurement_packet["source_step"],
+                measurement_packet=measurement_packet,
+                measurement_residual=measurement_residual,
+            )
+            self.aligned_history.append(aligned_pair)
+            self._refresh_ini_windows()
+        elif (
+            self.history_alignment == "async_masked"
+            and self.data_is_persistently_exciting
+            and self._effective_reference_step(measurement_packet) < measurement_packet["delivered_step"]
+        ):
+            self._update_async_source_slots(measurement_packet, measurement_residual)
+            self._refresh_ini_windows()
+
+        if self.history_alignment in {"time_aligned", "delay_ref_only", "suffix_aligned", "consistency_gated_time_aligned"}:
+            optimization_reference_step = measurement_packet["source_step"]
+            control_offset = measurement_packet["delay_steps"]
+        elif self.history_alignment == "async_masked":
+            optimization_reference_step = self._effective_reference_step(measurement_packet)
+            control_offset = max(0, measurement_packet["delivered_step"] - optimization_reference_step)
+        else:
+            optimization_reference_step = measurement_packet["delivered_step"]
+            control_offset = 0
+
+        self.ref.value = self._reference_window(optimization_reference_step, self.N)
+        self._update_consistency_gate_weights()
+        return control_offset
+
+    def _compute_control_candidate_for_active_bank(self, x_current, measurement_packet, measurement_residual):
+        control_offset = self._prepare_active_bank_for_measurement(measurement_packet, measurement_residual)
+        if self.data_is_persistently_exciting:
+            u_optimal = self.compute_optimal_control(control_offset=control_offset)
+            score = float(self.problem.value) if self.problem.value is not None else float("inf")
+        else:
+            u_optimal = self.initial_controller.compute_input(x_current, self.ref.value[:, 0])
+            score = float("inf")
+        return u_optimal, score
 
     def collect_and_update(self, measurement_packet, u_optimal, measurement_residual):
         delivered_step = int(measurement_packet["delivered_step"])
@@ -669,13 +694,57 @@ class DeePC:
             return "nominal"
         return self._plant_health_mode()
 
-    def _select_control_bank(self, desired_health_mode):
+    def _select_control_bank(self, desired_health_mode, x_current=None, measurement_packet=None, measurement_residual=None):
         desired_bank = self.bank_states[desired_health_mode]
         if desired_bank["data_is_persistently_exciting"]:
-            return desired_health_mode
-        if desired_health_mode == "degraded" and self.bank_states["nominal"]["data_is_persistently_exciting"]:
-            return "nominal"
-        return desired_health_mode
+            fallback_bank = desired_health_mode
+        elif desired_health_mode == "degraded" and self.bank_states["nominal"]["data_is_persistently_exciting"]:
+            fallback_bank = "nominal"
+        else:
+            fallback_bank = desired_health_mode
+
+        self.candidate_bank_scores = {}
+        if (
+            self.bank_selection_mode != "oracle_minimal"
+            or desired_health_mode != "degraded"
+            or measurement_packet is None
+            or measurement_residual is None
+            or x_current is None
+        ):
+            return fallback_bank
+
+        candidate_banks = [
+            bank_name
+            for bank_name in ("nominal", "degraded")
+            if self.bank_states[bank_name]["data_is_persistently_exciting"]
+        ]
+        if not candidate_banks:
+            return fallback_bank
+
+        best_bank = fallback_bank
+        best_score = float("inf")
+        for bank_name in candidate_banks:
+            self._restore_bank_state(bank_name)
+            _, score = self._compute_control_candidate_for_active_bank(
+                x_current,
+                measurement_packet,
+                measurement_residual,
+            )
+            self.candidate_bank_scores[bank_name] = score
+            if score < best_score:
+                best_score = score
+                best_bank = bank_name
+        return best_bank
+
+    def _bootstrap_degraded_bank_if_needed(self, desired_health_mode):
+        if desired_health_mode != "degraded":
+            return
+        if self.bank_states["degraded"]["data_is_persistently_exciting"]:
+            return
+        if not self.bank_states["nominal"]["data_is_persistently_exciting"]:
+            return
+        self.bank_states["degraded"] = self._copy_bank_state(self.bank_states["nominal"])
+        self.degraded_bank_bootstrapped = True
 
     def _capture_bank_state(self):
         return {
@@ -754,6 +823,34 @@ class DeePC:
 
     def _copy_history(self, history):
         return [self._copy_history_pair(pair) for pair in history]
+
+    def _copy_bank_state(self, bank_state):
+        return {
+            "data_is_persistently_exciting": bool(bank_state["data_is_persistently_exciting"]),
+            "u_d": self._copy_bank_array_or_list(bank_state["u_d"]),
+            "y_d": self._copy_bank_array_or_list(bank_state["y_d"]),
+            "measurement_residual_d": self._copy_bank_array_or_list(bank_state["measurement_residual_d"]),
+            "applied_inputs_by_step": {
+                int(step): np.asarray(value, dtype=float).copy()
+                for step, value in bank_state["applied_inputs_by_step"].items()
+            },
+            "received_history": self._copy_history(bank_state["received_history"]),
+            "aligned_history": self._copy_history(bank_state["aligned_history"]),
+            "async_source_slots": {
+                int(step): self._copy_history_pair(pair)
+                for step, pair in bank_state["async_source_slots"].items()
+            },
+            "next_async_training_source_step": int(bank_state["next_async_training_source_step"]),
+            "latest_measurement_metadata": None
+            if bank_state["latest_measurement_metadata"] is None
+            else dict(bank_state["latest_measurement_metadata"]),
+            "current_delay_steps": int(bank_state["current_delay_steps"]),
+            "Hpinv": None if bank_state["Hpinv"] is None else np.asarray(bank_state["Hpinv"], dtype=float).copy(),
+            "U_p": np.asarray(bank_state["U_p"], dtype=float).copy(),
+            "Y_p": np.asarray(bank_state["Y_p"], dtype=float).copy(),
+            "U_f": np.asarray(bank_state["U_f"], dtype=float).copy(),
+            "Y_f": np.asarray(bank_state["Y_f"], dtype=float).copy(),
+        }
 
     def _make_async_source_slot(self, source_step):
         previous_slot = self.async_source_slots.get(source_step - 1)
