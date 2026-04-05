@@ -29,6 +29,8 @@ class DeePC:
         consistency_gate_eps=1.0e-6,
         controller_health_mode="nominal",
         bank_selection_mode="fixed",
+        bank_transfer_mode="none",
+        bank_transfer_interval_steps=10,
     ):
         '''Initialize DeePC controller'''
 
@@ -45,6 +47,10 @@ class DeePC:
         self.bank_selection_mode = str(bank_selection_mode)
         if self.bank_selection_mode not in {"fixed", "oracle_minimal"}:
             raise ValueError("bank_selection_mode must be fixed or oracle_minimal")
+        self.bank_transfer_mode = str(bank_transfer_mode)
+        if self.bank_transfer_mode not in {"none", "warm_start_adapt"}:
+            raise ValueError("bank_transfer_mode must be none or warm_start_adapt")
+        self.bank_transfer_interval_steps = max(int(bank_transfer_interval_steps), 1)
         self.health_mode = self.controller_health_mode
         self.plant_health_mode = "nominal"
         self.requested_bank_name = self.controller_health_mode
@@ -52,6 +58,7 @@ class DeePC:
         self.training_bank_name = self.controller_health_mode
         self.candidate_bank_scores = {}
         self.degraded_bank_bootstrapped = False
+        self.degraded_bank_adaptation_steps = 0
         self.yaw_output_rows = [row for row, idx in enumerate(system.output_indices) if idx == 2]
         self.non_yaw_output_rows = [row for row in range(self.p) if row not in self.yaw_output_rows]
 
@@ -666,7 +673,12 @@ class DeePC:
         }
 
     def _append_training_pair(self, pair):
-        if pair is None or self.data_is_persistently_exciting:
+        if pair is None:
+            return
+
+        if self.data_is_persistently_exciting:
+            if self._should_refresh_mature_bank():
+                self._append_training_pair_to_mature_bank(pair)
             return
 
         self.u_d.append(pair["u"])
@@ -679,6 +691,38 @@ class DeePC:
             self.measurement_residual_d = np.array(self.measurement_residual_d).T
             self.create_and_partition_hankel_matrices()
             self.data_is_persistently_exciting = self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
+
+    def _should_refresh_mature_bank(self):
+        return (
+            self.bank_transfer_mode == "warm_start_adapt"
+            and self.health_mode == "degraded"
+            and self.degraded_bank_bootstrapped
+        )
+
+    def _append_training_pair_to_mature_bank(self, pair):
+        u_hist = self._as_history_list(self.u_d)
+        y_hist = self._as_history_list(self.y_d)
+        residual_hist = self._as_history_list(self.measurement_residual_d)
+
+        u_hist.append(np.asarray(pair["u"], dtype=float).reshape(self.m))
+        y_hist.append(np.asarray(pair["y"], dtype=float).reshape(self.p))
+        residual_hist.append(np.asarray(pair["measurement_residual"], dtype=float).reshape(self.p))
+
+        if len(u_hist) > self.T:
+            u_hist = u_hist[-self.T:]
+            y_hist = y_hist[-self.T:]
+            residual_hist = residual_hist[-self.T:]
+
+        self.u_d = np.array(u_hist, dtype=float).T
+        self.y_d = np.array(y_hist, dtype=float).T
+        self.measurement_residual_d = np.array(residual_hist, dtype=float).T
+        self.degraded_bank_adaptation_steps += 1
+        if (
+            self.degraded_bank_adaptation_steps == 1
+            or self.degraded_bank_adaptation_steps % self.bank_transfer_interval_steps == 0
+        ):
+            self.create_and_partition_hankel_matrices()
+        self.data_is_persistently_exciting = True
 
     def _active_bank_name(self):
         requested = getattr(self, "health_mode", "nominal")
@@ -745,6 +789,7 @@ class DeePC:
             return
         self.bank_states["degraded"] = self._copy_bank_state(self.bank_states["nominal"])
         self.degraded_bank_bootstrapped = True
+        self.bank_states["degraded"]["degraded_bank_adaptation_steps"] = 0
 
     def _capture_bank_state(self):
         return {
@@ -765,12 +810,21 @@ class DeePC:
             "next_async_training_source_step": int(self.next_async_training_source_step),
             "latest_measurement_metadata": None if self.latest_measurement_metadata is None else dict(self.latest_measurement_metadata),
             "current_delay_steps": int(self.current_delay_steps),
+            "degraded_bank_adaptation_steps": int(self.degraded_bank_adaptation_steps),
             "Hpinv": None if self.Hpinv is None else np.asarray(self.Hpinv, dtype=float).copy(),
             "U_p": np.asarray(self.U_p.value, dtype=float).copy(),
             "Y_p": np.asarray(self.Y_p.value, dtype=float).copy(),
             "U_f": np.asarray(self.U_f.value, dtype=float).copy(),
             "Y_f": np.asarray(self.Y_f.value, dtype=float).copy(),
         }
+
+    def _as_history_list(self, value):
+        if isinstance(value, list):
+            return [np.asarray(item, dtype=float).copy() for item in value]
+        array = np.asarray(value, dtype=float)
+        if array.ndim != 2:
+            raise ValueError(f"Expected 2D bank history array, got shape {array.shape}")
+        return [array[:, idx].copy() for idx in range(array.shape[1])]
 
     def _restore_active_bank_state(self):
         self._restore_bank_state(self._active_bank_name())
@@ -795,6 +849,7 @@ class DeePC:
         self.next_async_training_source_step = int(bank["next_async_training_source_step"])
         self.latest_measurement_metadata = None if bank["latest_measurement_metadata"] is None else dict(bank["latest_measurement_metadata"])
         self.current_delay_steps = int(bank["current_delay_steps"])
+        self.degraded_bank_adaptation_steps = int(bank.get("degraded_bank_adaptation_steps", 0))
         self.Hpinv = None if bank["Hpinv"] is None else np.asarray(bank["Hpinv"], dtype=float).copy()
         self.U_p.value = np.asarray(bank["U_p"], dtype=float).copy()
         self.Y_p.value = np.asarray(bank["Y_p"], dtype=float).copy()
@@ -845,6 +900,7 @@ class DeePC:
             if bank_state["latest_measurement_metadata"] is None
             else dict(bank_state["latest_measurement_metadata"]),
             "current_delay_steps": int(bank_state["current_delay_steps"]),
+            "degraded_bank_adaptation_steps": int(bank_state.get("degraded_bank_adaptation_steps", 0)),
             "Hpinv": None if bank_state["Hpinv"] is None else np.asarray(bank_state["Hpinv"], dtype=float).copy(),
             "U_p": np.asarray(bank_state["U_p"], dtype=float).copy(),
             "Y_p": np.asarray(bank_state["Y_p"], dtype=float).copy(),

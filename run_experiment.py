@@ -176,6 +176,8 @@ def build_controller(args, system, trajectory):
             consistency_gate_eps=args.deepc_consistency_gate_eps,
             controller_health_mode=args.deepc_health_mode,
             bank_selection_mode=args.deepc_bank_selection,
+            bank_transfer_mode=args.deepc_bank_transfer_mode,
+            bank_transfer_interval_steps=args.deepc_bank_transfer_interval_steps,
         )
 
     if args.controller == "mpc":
@@ -308,12 +310,15 @@ def run_single_experiment(args):
             "health_mode": getattr(controller, "health_mode", fault_config["health_mode"]),
             "controller_health_mode": getattr(controller, "controller_health_mode", fault_config["health_mode"]),
             "bank_selection_mode": getattr(controller, "bank_selection_mode", "fixed"),
+            "bank_transfer_mode": getattr(controller, "bank_transfer_mode", "none"),
+            "bank_transfer_interval_steps": int(getattr(controller, "bank_transfer_interval_steps", 1)),
             "plant_health_mode": getattr(controller, "plant_health_mode", "nominal"),
             "requested_bank_name": getattr(controller, "requested_bank_name", getattr(controller, "health_mode", "nominal")),
             "control_bank_name": getattr(controller, "control_bank_name", getattr(controller, "health_mode", "nominal")),
             "training_bank_name": getattr(controller, "training_bank_name", getattr(controller, "health_mode", "nominal")),
             "candidate_bank_scores": getattr(controller, "candidate_bank_scores", {}),
             "degraded_bank_bootstrapped": getattr(controller, "degraded_bank_bootstrapped", False),
+            "degraded_bank_adaptation_steps": int(getattr(controller, "degraded_bank_adaptation_steps", 0)),
         }
     if args.controller == "mpc":
         output["mpc"] = {
@@ -395,6 +400,8 @@ def build_parser():
     parser.add_argument("--fault-start-time", type=float, default=0.0)
     parser.add_argument("--deepc-health-mode", choices=["nominal", "degraded"], default="nominal")
     parser.add_argument("--deepc-bank-selection", choices=["fixed", "oracle_minimal"], default="fixed")
+    parser.add_argument("--deepc-bank-transfer-mode", choices=["none", "warm_start_adapt"], default="none")
+    parser.add_argument("--deepc-bank-transfer-interval-steps", type=int, default=10)
     return parser
 
 
