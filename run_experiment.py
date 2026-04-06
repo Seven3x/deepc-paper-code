@@ -6,9 +6,12 @@ from pathlib import Path
 import numpy as np
 
 from Controllers.deepc import DeePC
+from Controllers.identified_linear_mpc import IdentifiedLinearMPC
 from Controllers.linear_mpc import LinearMPC
+from Controllers.additive_excitation import AdditiveExcitationController
 from Controllers.lqr_tracking import LQRTrackingController
 from Controllers.lqr import LQR
+from Controllers.prbs_excitation import PRBSExcitationController
 from Controllers.random_excitation import RandomExcitationController
 from Simulator.simulation import Simulation, SimulationPlotter
 from hdf5_reader import HDF5Reader
@@ -140,6 +143,63 @@ def build_controller(args, system, trajectory):
             seed=args.seed,
         )
 
+    if args.controller == "identified_mpc":
+        def build_id_excitation_controller():
+            if args.identified_mpc_id_controller == "lqr":
+                return LQR(system, noise=args.identified_mpc_id_noise, seed=args.seed)
+            if args.identified_mpc_id_controller == "random":
+                return RandomExcitationController(
+                    system=system,
+                    amplitude=args.identified_mpc_id_amplitude,
+                    seed=args.seed,
+                )
+            if args.identified_mpc_id_controller == "prbs":
+                return PRBSExcitationController(
+                    system=system,
+                    amplitude=args.identified_mpc_id_amplitude,
+                    hold_steps=args.identified_mpc_prbs_hold_steps,
+                    seed=args.seed,
+                )
+            if args.identified_mpc_id_controller == "lqr_random":
+                return AdditiveExcitationController(
+                    system=system,
+                    base_controller=LQR(system, noise=0.0, seed=args.seed),
+                    excitation_controller=RandomExcitationController(
+                        system=system,
+                        amplitude=args.identified_mpc_id_amplitude,
+                        seed=args.seed,
+                    ),
+                )
+            if args.identified_mpc_id_controller == "lqr_prbs":
+                return AdditiveExcitationController(
+                    system=system,
+                    base_controller=LQR(system, noise=0.0, seed=args.seed),
+                    excitation_controller=PRBSExcitationController(
+                        system=system,
+                        amplitude=args.identified_mpc_id_amplitude,
+                        hold_steps=args.identified_mpc_prbs_hold_steps,
+                        seed=args.seed,
+                    ),
+                )
+            raise ValueError(f"Unsupported identified MPC ID controller: {args.identified_mpc_id_controller}")
+
+        initial_controller = build_id_excitation_controller()
+        id_data_length = max(
+            (args.deepc_T_ini + args.deepc_N) * (1 + system.m + system.p) - 1,
+            (system.m + 1) * (args.deepc_T_ini + args.deepc_N + system.n) - 1,
+        ) + args.deepc_data_length_extra
+        if args.identified_mpc_id_length is not None:
+            id_data_length = int(args.identified_mpc_id_length)
+        return IdentifiedLinearMPC(
+            system=system,
+            trajectory=trajectory,
+            initial_controller=initial_controller,
+            id_data_length=id_data_length,
+            horizon=args.mpc_N,
+            solver=args.mpc_solver,
+            ridge=args.identified_mpc_ridge,
+        )
+
     if args.controller == "deepc":
         if args.deepc_initial_controller == "lqr":
             initial_controller = LQR(system, noise=args.lqr_noise, seed=args.seed)
@@ -261,14 +321,18 @@ def run_single_experiment(args):
     )
     controller = build_controller(args, system, trajectory)
 
-    task_start_steps = int(getattr(controller, "T", 0)) if args.controller == "deepc" else 0
+    task_start_steps = 0
+    if hasattr(controller, "task_start_steps"):
+        task_start_steps = int(getattr(controller, "task_start_steps"))
+    elif hasattr(controller, "T") and args.controller == "deepc":
+        task_start_steps = int(getattr(controller, "T"))
     task_start_time = task_start_steps * system.h
     effective_fault_config = dict(fault_config)
     effective_fault_config["start_time"] = float(args.fault_start_time) + float(task_start_time)
     system.fault_config = system._normalize_fault_config(effective_fault_config)
 
-    if args.controller == "deepc":
-        t_final = controller.T * system.h + args.reference_duration
+    if task_start_steps > 0:
+        t_final = task_start_steps * system.h + args.reference_duration
     else:
         t_final = args.reference_duration
 
@@ -360,6 +424,20 @@ def run_single_experiment(args):
             "N": args.mpc_N,
             "solver": args.mpc_solver,
         }
+    if args.controller == "identified_mpc":
+        output["identified_mpc"] = {
+            "N": args.mpc_N,
+            "solver": args.mpc_solver,
+            "id_controller": args.identified_mpc_id_controller,
+            "id_amplitude": float(args.identified_mpc_id_amplitude),
+            "id_noise": float(args.identified_mpc_id_noise),
+            "prbs_hold_steps": int(args.identified_mpc_prbs_hold_steps),
+            "ridge": float(args.identified_mpc_ridge),
+            "id_length_override": (
+                None if args.identified_mpc_id_length is None else int(args.identified_mpc_id_length)
+            ),
+            "online_state_source": "observer_from_measurements",
+        }
 
     run_dir = RESULTS_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -381,7 +459,7 @@ def run_single_experiment(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Run a reproducible DeePC quadcopter experiment.")
-    parser.add_argument("--controller", choices=["lqr", "mpc", "deepc"], required=True)
+    parser.add_argument("--controller", choices=["lqr", "mpc", "identified_mpc", "deepc"], required=True)
     parser.add_argument("--trajectory", choices=["constant", "figure8", "step", "box"], default="figure8")
     parser.add_argument("--output-set", choices=["xyzpsi", "xyz"], default="xyzpsi")
     parser.add_argument("--reference-duration", type=float, default=12.0)
@@ -413,6 +491,16 @@ def build_parser():
     parser.add_argument("--deepc-data-length-extra", type=int, default=0)
     parser.add_argument("--mpc-N", dest="mpc_N", type=int, default=10)
     parser.add_argument("--mpc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
+    parser.add_argument(
+        "--identified-mpc-id-controller",
+        choices=["lqr", "random", "prbs", "lqr_random", "lqr_prbs"],
+        default="lqr_prbs",
+    )
+    parser.add_argument("--identified-mpc-id-amplitude", type=float, default=0.15)
+    parser.add_argument("--identified-mpc-id-noise", type=float, default=0.0)
+    parser.add_argument("--identified-mpc-prbs-hold-steps", type=int, default=5)
+    parser.add_argument("--identified-mpc-ridge", type=float, default=1.0e-6)
+    parser.add_argument("--identified-mpc-id-length", type=int, default=None)
     parser.add_argument("--tag", default="")
     parser.add_argument("--save-hdf5", action="store_true")
     parser.add_argument("--save-plots", action="store_true")
