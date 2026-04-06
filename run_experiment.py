@@ -400,7 +400,11 @@ def build_parser():
     parser.add_argument("--fault-start-time", type=float, default=0.0)
     parser.add_argument("--deepc-health-mode", choices=["nominal", "degraded"], default="nominal")
     parser.add_argument("--deepc-bank-selection", choices=["fixed", "oracle_minimal"], default="fixed")
-    parser.add_argument("--deepc-bank-transfer-mode", choices=["none", "warm_start_adapt"], default="none")
+    parser.add_argument(
+        "--deepc-bank-transfer-mode",
+        choices=["none", "warm_start_only", "adapt_only", "warm_start_adapt"],
+        default="none",
+    )
     parser.add_argument("--deepc-bank-transfer-interval-steps", type=int, default=10)
     return parser
 

@@ -48,8 +48,10 @@ class DeePC:
         if self.bank_selection_mode not in {"fixed", "oracle_minimal"}:
             raise ValueError("bank_selection_mode must be fixed or oracle_minimal")
         self.bank_transfer_mode = str(bank_transfer_mode)
-        if self.bank_transfer_mode not in {"none", "warm_start_adapt"}:
-            raise ValueError("bank_transfer_mode must be none or warm_start_adapt")
+        if self.bank_transfer_mode not in {"none", "warm_start_only", "adapt_only", "warm_start_adapt"}:
+            raise ValueError(
+                "bank_transfer_mode must be one of: none, warm_start_only, adapt_only, warm_start_adapt"
+            )
         self.bank_transfer_interval_steps = max(int(bank_transfer_interval_steps), 1)
         self.health_mode = self.controller_health_mode
         self.plant_health_mode = "nominal"
@@ -693,11 +695,13 @@ class DeePC:
             self.data_is_persistently_exciting = self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
 
     def _should_refresh_mature_bank(self):
-        return (
-            self.bank_transfer_mode == "warm_start_adapt"
-            and self.health_mode == "degraded"
-            and self.degraded_bank_bootstrapped
-        )
+        if self.health_mode != "degraded":
+            return False
+        if self.bank_transfer_mode == "warm_start_adapt":
+            return self.degraded_bank_bootstrapped
+        if self.bank_transfer_mode == "adapt_only":
+            return True
+        return False
 
     def _append_training_pair_to_mature_bank(self, pair):
         u_hist = self._as_history_list(self.u_d)
@@ -781,6 +785,8 @@ class DeePC:
         return best_bank
 
     def _bootstrap_degraded_bank_if_needed(self, desired_health_mode):
+        if self.bank_transfer_mode == "adapt_only":
+            return
         if desired_health_mode != "degraded":
             return
         if self.bank_states["degraded"]["data_is_persistently_exciting"]:
