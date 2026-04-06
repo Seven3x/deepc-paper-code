@@ -143,6 +143,13 @@ def build_controller(args, system, trajectory):
     if args.controller == "deepc":
         if args.deepc_initial_controller == "lqr":
             initial_controller = LQR(system, noise=args.lqr_noise, seed=args.seed)
+        elif args.deepc_initial_controller == "mpc":
+            initial_controller = LinearMPC(
+                system=system,
+                trajectory=trajectory,
+                horizon=args.mpc_N,
+                solver=args.mpc_solver,
+            )
         elif args.deepc_initial_controller == "random":
             initial_controller = RandomExcitationController(
                 system=system,
@@ -191,10 +198,21 @@ def build_controller(args, system, trajectory):
     raise ValueError(f"Unsupported controller: {args.controller}")
 
 
-def compute_metrics(result, trajectory, system):
-    y_eval = result.get("y_true", result["y"])
-    total_steps = y_eval.shape[1]
-    ref = trajectory.extend_reference(trajectory.output_reference, total_steps)[:, :total_steps]
+def compute_metrics(result, trajectory, system, eval_start_step=0, eval_num_steps=None):
+    y_eval_full = result.get("y_true", result["y"])
+    total_steps = y_eval_full.shape[1]
+    ref_full = trajectory.extend_reference(trajectory.output_reference, total_steps)[:, :total_steps]
+
+    start = max(int(eval_start_step), 0)
+    if eval_num_steps is None:
+        stop = total_steps
+    else:
+        stop = min(start + max(int(eval_num_steps), 1), total_steps)
+    if stop <= start:
+        raise ValueError(f"Invalid evaluation window: start={start}, stop={stop}, total_steps={total_steps}")
+
+    y_eval = y_eval_full[:, start:stop]
+    ref = ref_full[:, start:stop]
     err = y_eval - ref
 
     position_rows = [i for i, idx in enumerate(system.output_indices) if idx in (9, 10, 11)]
@@ -208,7 +226,9 @@ def compute_metrics(result, trajectory, system):
         has_yaw_output = False
 
     metrics = {
-        "num_steps": int(total_steps),
+        "num_steps": int(y_eval.shape[1]),
+        "evaluation_start_step": int(start),
+        "evaluation_stop_step": int(stop),
         "rmse_all_outputs": float(np.sqrt(np.mean(np.square(err)))),
         "rmse_position": float(np.sqrt(np.mean(np.square(pos_err)))),
         "rmse_yaw": float(np.sqrt(np.mean(np.square(yaw_err)))),
@@ -241,6 +261,12 @@ def run_single_experiment(args):
     )
     controller = build_controller(args, system, trajectory)
 
+    task_start_steps = int(getattr(controller, "T", 0)) if args.controller == "deepc" else 0
+    task_start_time = task_start_steps * system.h
+    effective_fault_config = dict(fault_config)
+    effective_fault_config["start_time"] = float(args.fault_start_time) + float(task_start_time)
+    system.fault_config = system._normalize_fault_config(effective_fault_config)
+
     if args.controller == "deepc":
         t_final = controller.T * system.h + args.reference_duration
     else:
@@ -254,7 +280,14 @@ def run_single_experiment(args):
         verbose=not args.quiet,
     )
     result = sim.simulate()
-    metrics = compute_metrics(result, trajectory, system)
+    eval_num_steps = int(round(args.reference_duration / system.h))
+    metrics = compute_metrics(
+        result,
+        trajectory,
+        system,
+        eval_start_step=task_start_steps,
+        eval_num_steps=eval_num_steps,
+    )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{args.controller}_{args.trajectory}_{timestamp}"
@@ -268,13 +301,15 @@ def run_single_experiment(args):
         "sampling_time": args.sampling_time,
         "dt": args.dt,
         "reference_duration": args.reference_duration,
+        "task_start_time": float(task_start_time),
+        "task_start_steps": int(task_start_steps),
         "seed": args.seed,
         "output_set": args.output_set,
         "lqr_noise": args.lqr_noise,
         "regularized": args.controller != "deepc" or not args.disable_regularization,
         "metrics": metrics,
         "measurement": serialize_measurement_config(measurement_config),
-        "fault": serialize_fault_config(fault_config),
+        "fault": serialize_fault_config(system.fault_config),
     }
 
     if args.controller == "deepc":
@@ -360,7 +395,7 @@ def build_parser():
     parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1.0e4)
     parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=30.0)
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
-    parser.add_argument("--deepc-initial-controller", choices=["lqr", "random"], default="lqr")
+    parser.add_argument("--deepc-initial-controller", choices=["lqr", "mpc", "random"], default="lqr")
     parser.add_argument("--deepc-random-excitation-amplitude", type=float, default=0.15)
     parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise", "residual_stats", "residual_variance", "residual_bias_variance", "robust_residual_stats", "block_l2", "yaw_selective_slack", "drop_yaw_past"], default="uniform")
     parser.add_argument("--deepc-attitude-slack-weight", type=float, default=1.0)

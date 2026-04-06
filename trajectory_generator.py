@@ -46,7 +46,14 @@ class TrajectoryGenerator:
         
         return ref
     
-    def generate_step_reference(self, start_value=[-0.5,-0.5,0], end_value=[0.5,0.5,-1], step_time=3.0, duration=20.0):
+    def generate_step_reference(
+        self,
+        start_value=[-0.5, -0.5, 0],
+        end_value=[0.5, 0.5, -1],
+        step_time=3.0,
+        duration=20.0,
+        ramp_duration=5.0,
+    ):
         """
         Generate a step reference trajectory.
 
@@ -63,15 +70,19 @@ class TrajectoryGenerator:
         t = np.arange(0, duration, Ts)
 
         ref = np.zeros((self.system.p, len(t)))
-        ref_indices = t < step_time
 
-        ref[-3, ref_indices] = start_value[0]
-        ref[-2, ref_indices] = start_value[1]
-        ref[-1, ref_indices] = start_value[2]
+        start = np.asarray(start_value, dtype=float).reshape(3, 1)
+        end = np.asarray(end_value, dtype=float).reshape(3, 1)
+        if ramp_duration <= 0:
+            alpha = (t >= step_time).astype(float)
+        else:
+            alpha = np.clip((t - step_time) / ramp_duration, 0.0, 1.0)
+            # Use a half-cosine easing to avoid an impulsive reference jump that
+            # can destabilize the nominal step benchmark.
+            alpha = 0.5 - 0.5 * np.cos(np.pi * alpha)
+        xyz = start @ np.ones((1, len(t))) * (1.0 - alpha) + end @ np.ones((1, len(t))) * alpha
 
-        ref[-3, ~ref_indices] = end_value[0]
-        ref[-2, ~ref_indices] = end_value[1]
-        ref[-1, ~ref_indices] = end_value[2]
+        ref[-3:, :] = xyz
 
         return ref
     
