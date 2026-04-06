@@ -61,7 +61,8 @@ class LinearMPC:
         ]
         return constraints
 
-    def compute_input(self, x_current):
+    def compute_input(self, x_current, y_current=None):
+        del y_current
         self.x0.value = x_current
         self.ref.value = self.remaining_output_reference[:, :self.N]
 

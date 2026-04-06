@@ -21,6 +21,10 @@ def parse_float_list(raw):
     return [float(item.strip()) for item in raw.split(",") if item.strip()]
 
 
+def parse_int_list(raw):
+    return [int(item.strip()) for item in raw.split(",") if item.strip()]
+
+
 def build_measurement_config(args):
     noise_std = parse_float_list(args.measurement_noise_std)
     if len(noise_std) == 1:
@@ -37,6 +41,20 @@ def build_measurement_config(args):
         "yaw_bias": args.measurement_yaw_bias,
         "yaw_drift_per_sec": args.measurement_yaw_drift_per_sec,
         "seed": args.measurement_seed,
+        "delay_steps": args.measurement_delay_steps,
+        "async_period_steps": parse_int_list(args.measurement_async_period_steps),
+        "burst_dropout_rate": args.measurement_burst_dropout_rate,
+        "burst_dropout_length": args.measurement_burst_dropout_length,
+    }
+
+
+def build_fault_config(args):
+    return {
+        "mode": args.fault_mode,
+        "rotor_index": args.fault_rotor_index,
+        "efficiency_scale": args.fault_efficiency_scale,
+        "health_mode": args.deepc_health_mode,
+        "start_time": args.fault_start_time,
     }
 
 
@@ -49,6 +67,20 @@ def serialize_measurement_config(config):
         "yaw_bias": float(config["yaw_bias"]),
         "yaw_drift_per_sec": float(config["yaw_drift_per_sec"]),
         "seed": int(config["seed"]),
+        "delay_steps": int(config.get("delay_steps", 0)),
+        "async_period_steps": [int(item) for item in config.get("async_period_steps", [])],
+        "burst_dropout_rate": float(config.get("burst_dropout_rate", 0.0)),
+        "burst_dropout_length": int(config.get("burst_dropout_length", 0)),
+    }
+
+
+def serialize_fault_config(config):
+    return {
+        "mode": str(config["mode"]),
+        "rotor_index": int(config["rotor_index"]),
+        "efficiency_scale": float(config["efficiency_scale"]),
+        "health_mode": str(config["health_mode"]),
+        "start_time": float(config["start_time"]),
     }
 
 
@@ -79,7 +111,12 @@ def build_sigma_y_group_weights(args, system):
         weights = inv_std / median_inv_std
         return np.clip(weights, args.deepc_measurement_weight_min, args.deepc_measurement_weight_max)
 
-    if args.deepc_regularization_mode == "residual_stats":
+    if args.deepc_regularization_mode in {
+        "residual_stats",
+        "residual_variance",
+        "residual_bias_variance",
+        "robust_residual_stats",
+    }:
         return np.ones(system.p)
 
     if args.deepc_regularization_mode == "yaw_selective_slack":
@@ -133,6 +170,14 @@ def build_controller(args, system, trajectory):
             block_lambda_yaw=args.deepc_block_lambda_yaw,
             block_lambda_position=args.deepc_block_lambda_position,
             data_length_extra=args.deepc_data_length_extra,
+            history_alignment=args.deepc_history_alignment,
+            consistency_gate_lambda=args.deepc_consistency_gate_lambda,
+            consistency_gate_clip=args.deepc_consistency_gate_clip,
+            consistency_gate_eps=args.deepc_consistency_gate_eps,
+            controller_health_mode=args.deepc_health_mode,
+            bank_selection_mode=args.deepc_bank_selection,
+            bank_transfer_mode=args.deepc_bank_transfer_mode,
+            bank_transfer_interval_steps=args.deepc_bank_transfer_interval_steps,
         )
 
     if args.controller == "mpc":
@@ -147,10 +192,10 @@ def build_controller(args, system, trajectory):
 
 
 def compute_metrics(result, trajectory, system):
-    y = result["y"]
-    total_steps = y.shape[1]
+    y_eval = result.get("y_true", result["y"])
+    total_steps = y_eval.shape[1]
     ref = trajectory.extend_reference(trajectory.output_reference, total_steps)[:, :total_steps]
-    err = y - ref
+    err = y_eval - ref
 
     position_rows = [i for i, idx in enumerate(system.output_indices) if idx in (9, 10, 11)]
     pos_err = err[position_rows, :]
@@ -171,7 +216,7 @@ def compute_metrics(result, trajectory, system):
         "max_abs_position_error": float(np.max(np.abs(pos_err))),
         "max_abs_yaw_error": float(np.max(np.abs(yaw_err))),
         "has_yaw_output": has_yaw_output,
-        "all_finite": bool(np.isfinite(y).all()),
+        "all_finite": bool(np.isfinite(y_eval).all()),
     }
     return metrics
 
@@ -179,11 +224,13 @@ def compute_metrics(result, trajectory, system):
 def run_single_experiment(args):
     ensure_output_dirs()
     measurement_config = build_measurement_config(args)
+    fault_config = build_fault_config(args)
 
     system = Quadcopter(
         h=args.sampling_time,
         measurement_config=measurement_config,
         output_set=args.output_set,
+        fault_config=fault_config,
     )
     has_initial_ref = args.controller == "deepc"
     trajectory = TrajectoryGenerator(
@@ -227,6 +274,7 @@ def run_single_experiment(args):
         "regularized": args.controller != "deepc" or not args.disable_regularization,
         "metrics": metrics,
         "measurement": serialize_measurement_config(measurement_config),
+        "fault": serialize_fault_config(fault_config),
     }
 
     if args.controller == "deepc":
@@ -249,8 +297,28 @@ def run_single_experiment(args):
             "block_lambda_yaw": args.deepc_block_lambda_yaw,
             "block_lambda_position": args.deepc_block_lambda_position,
             "data_length_extra": args.deepc_data_length_extra,
+            "history_alignment": args.deepc_history_alignment,
+            "consistency_gate_lambda": args.deepc_consistency_gate_lambda,
+            "consistency_gate_clip": args.deepc_consistency_gate_clip,
+            "consistency_gate_eps": args.deepc_consistency_gate_eps,
             "effective_sigma_y_weights": np.asarray(controller.sigma_y_group_weights.value).reshape(-1).tolist(),
+            "residual_stat_summary": controller.residual_stat_summary,
+            "consistency_gate_summary": controller.consistency_gate_summary,
             "data_length_T": int(controller.T),
+            "latest_measurement_metadata": controller.latest_measurement_metadata,
+            "bank_mode": getattr(controller, "bank_mode", "single_bank"),
+            "health_mode": getattr(controller, "health_mode", fault_config["health_mode"]),
+            "controller_health_mode": getattr(controller, "controller_health_mode", fault_config["health_mode"]),
+            "bank_selection_mode": getattr(controller, "bank_selection_mode", "fixed"),
+            "bank_transfer_mode": getattr(controller, "bank_transfer_mode", "none"),
+            "bank_transfer_interval_steps": int(getattr(controller, "bank_transfer_interval_steps", 1)),
+            "plant_health_mode": getattr(controller, "plant_health_mode", "nominal"),
+            "requested_bank_name": getattr(controller, "requested_bank_name", getattr(controller, "health_mode", "nominal")),
+            "control_bank_name": getattr(controller, "control_bank_name", getattr(controller, "health_mode", "nominal")),
+            "training_bank_name": getattr(controller, "training_bank_name", getattr(controller, "health_mode", "nominal")),
+            "candidate_bank_scores": getattr(controller, "candidate_bank_scores", {}),
+            "degraded_bank_bootstrapped": getattr(controller, "degraded_bank_bootstrapped", False),
+            "degraded_bank_adaptation_steps": int(getattr(controller, "degraded_bank_adaptation_steps", 0)),
         }
     if args.controller == "mpc":
         output["mpc"] = {
@@ -294,7 +362,7 @@ def build_parser():
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
     parser.add_argument("--deepc-initial-controller", choices=["lqr", "random"], default="lqr")
     parser.add_argument("--deepc-random-excitation-amplitude", type=float, default=0.15)
-    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise", "residual_stats", "block_l2", "yaw_selective_slack", "drop_yaw_past"], default="uniform")
+    parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise", "residual_stats", "residual_variance", "residual_bias_variance", "robust_residual_stats", "block_l2", "yaw_selective_slack", "drop_yaw_past"], default="uniform")
     parser.add_argument("--deepc-attitude-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-position-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-output-slack-weights", default="1,1,1,1,1,1")
@@ -318,6 +386,22 @@ def build_parser():
     parser.add_argument("--measurement-yaw-bias", type=float, default=0.0)
     parser.add_argument("--measurement-yaw-drift-per-sec", type=float, default=0.0)
     parser.add_argument("--measurement-seed", type=int, default=0)
+    parser.add_argument("--measurement-delay-steps", type=int, default=0)
+    parser.add_argument("--measurement-async-period-steps", default="1,1,1,1,1,1")
+    parser.add_argument("--measurement-burst-dropout-rate", type=float, default=0.0)
+    parser.add_argument("--measurement-burst-dropout-length", type=int, default=0)
+    parser.add_argument("--deepc-history-alignment", choices=["naive", "delay_ref_only", "time_aligned", "suffix_aligned", "consistency_gated_time_aligned", "async_masked"], default="naive")
+    parser.add_argument("--deepc-consistency-gate-lambda", type=float, default=3.0)
+    parser.add_argument("--deepc-consistency-gate-clip", type=float, default=3.0)
+    parser.add_argument("--deepc-consistency-gate-eps", type=float, default=1.0e-6)
+    parser.add_argument("--fault-mode", choices=["nominal", "single_rotor_efficiency_drop"], default="nominal")
+    parser.add_argument("--fault-rotor-index", type=int, default=0)
+    parser.add_argument("--fault-efficiency-scale", type=float, default=1.0)
+    parser.add_argument("--fault-start-time", type=float, default=0.0)
+    parser.add_argument("--deepc-health-mode", choices=["nominal", "degraded"], default="nominal")
+    parser.add_argument("--deepc-bank-selection", choices=["fixed", "oracle_minimal"], default="fixed")
+    parser.add_argument("--deepc-bank-transfer-mode", choices=["none", "warm_start_adapt"], default="none")
+    parser.add_argument("--deepc-bank-transfer-interval-steps", type=int, default=10)
     return parser
 
 

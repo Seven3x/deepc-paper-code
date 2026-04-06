@@ -5,7 +5,7 @@ from scipy.integrate import quad_vec, quad
 import control
 
 class Quadcopter:
-    def __init__(self, h, measurement_config=None, output_set="xyzpsi"):
+    def __init__(self, h, measurement_config=None, output_set="xyzpsi", fault_config=None):
         self.n = 12
         self.m = 4
         self.h = h #ZOH sampling time
@@ -78,6 +78,8 @@ class Quadcopter:
         self.R = 1*np.eye(self.m)
 
         self.measurement_config = self._normalize_measurement_config(measurement_config)
+        self.fault_config = self._normalize_fault_config(fault_config)
+        self.current_time = 0.0
         self._measurement_rng = np.random.default_rng(self.measurement_config["seed"])
         self._measurement_step = 0
         self._current_yaw_bias = self.measurement_config["yaw_bias"]
@@ -97,6 +99,7 @@ class Quadcopter:
             xdot (12x1 np.ndarray): Time derivative of the state vector
         '''
 
+        u_input = self._apply_actuator_degradation(u_input, symbolic=symbolic)
         u_input = u_input * self.max_thrust # Scale input from 0-1 to thrust
 
         Phi, Theta, Psi, p, q, r, u, v, w, _, _, _ = x
@@ -190,6 +193,10 @@ class Quadcopter:
             "yaw_bias": 0.0,
             "yaw_drift_per_sec": 0.0,
             "seed": 0,
+            "delay_steps": 0,
+            "async_period_steps": np.ones(self.p, dtype=int),
+            "burst_dropout_rate": 0.0,
+            "burst_dropout_length": 0,
         }
         if measurement_config is None:
             return config
@@ -197,6 +204,9 @@ class Quadcopter:
         config["yaw_bias"] = float(measurement_config.get("yaw_bias", 0.0))
         config["yaw_drift_per_sec"] = float(measurement_config.get("yaw_drift_per_sec", 0.0))
         config["seed"] = int(measurement_config.get("seed", 0))
+        config["delay_steps"] = int(measurement_config.get("delay_steps", 0))
+        config["burst_dropout_rate"] = float(measurement_config.get("burst_dropout_rate", 0.0))
+        config["burst_dropout_length"] = int(measurement_config.get("burst_dropout_length", 0))
 
         noise_std = measurement_config.get("noise_std", 0.0)
         if np.isscalar(noise_std):
@@ -207,7 +217,70 @@ class Quadcopter:
                 raise ValueError(f"measurement noise_std must have shape ({self.p},), got {noise_std.shape}")
             config["noise_std"] = noise_std
 
+        async_period_steps = measurement_config.get("async_period_steps", np.ones(self.p, dtype=int))
+        async_period_steps = np.asarray(async_period_steps, dtype=int).reshape(-1)
+        if async_period_steps.size == 1:
+            async_period_steps = np.repeat(async_period_steps, self.p)
+        elif self.output_set == "xyz" and async_period_steps.size == 6:
+            async_period_steps = async_period_steps[3:]
+        elif async_period_steps.size != self.p:
+            raise ValueError(
+                f"measurement async_period_steps must have shape ({self.p},) or be scalar, got {async_period_steps.shape}"
+            )
+        if np.any(async_period_steps <= 0):
+            raise ValueError("measurement async_period_steps must be strictly positive")
+        config["async_period_steps"] = async_period_steps
+
         return config
+
+    def _normalize_fault_config(self, fault_config):
+        config = {
+            "mode": "nominal",
+            "rotor_index": 0,
+            "efficiency_scale": 1.0,
+            "health_mode": "nominal",
+            "start_time": 0.0,
+        }
+        if fault_config is None:
+            return config
+
+        config["mode"] = str(fault_config.get("mode", "nominal"))
+        config["rotor_index"] = int(fault_config.get("rotor_index", 0))
+        config["efficiency_scale"] = float(fault_config.get("efficiency_scale", 1.0))
+        config["health_mode"] = str(fault_config.get("health_mode", "nominal"))
+        config["start_time"] = float(fault_config.get("start_time", 0.0))
+
+        if config["mode"] not in {"nominal", "single_rotor_efficiency_drop"}:
+            raise ValueError(f"Unsupported fault mode: {config['mode']}")
+        if not 0 <= config["rotor_index"] < self.m:
+            raise ValueError(f"fault rotor_index must be in [0, {self.m - 1}]")
+        if not 0.0 < config["efficiency_scale"] <= 1.0:
+            raise ValueError("fault efficiency_scale must be in (0, 1]")
+        if config["health_mode"] not in {"nominal", "degraded"}:
+            raise ValueError("fault health_mode must be nominal or degraded")
+
+        if config["mode"] == "nominal":
+            config["health_mode"] = "nominal"
+            config["efficiency_scale"] = 1.0
+
+        return config
+
+    def _apply_actuator_degradation(self, u_input, symbolic=False):
+        if symbolic:
+            effective_u = sp.Matrix(u_input)
+        else:
+            effective_u = np.asarray(u_input, dtype=float).copy()
+        if self.is_fault_active() and self.fault_config["mode"] == "single_rotor_efficiency_drop":
+            effective_u[self.fault_config["rotor_index"]] *= self.fault_config["efficiency_scale"]
+        return effective_u
+
+    def is_fault_active(self):
+        if self.fault_config["mode"] == "nominal":
+            return False
+        return float(self.current_time) >= float(self.fault_config["start_time"])
+
+    def current_health_mode(self):
+        return "degraded" if self.is_fault_active() else "nominal"
     
     def output_constraint(self, y):
         return self.F@y <= self.f
