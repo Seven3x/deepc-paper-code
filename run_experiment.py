@@ -203,6 +203,27 @@ def build_controller(args, system, trajectory):
     if args.controller == "deepc":
         if args.deepc_initial_controller == "lqr":
             initial_controller = LQR(system, noise=args.lqr_noise, seed=args.seed)
+        elif args.deepc_initial_controller == "lqr_random":
+            initial_controller = AdditiveExcitationController(
+                system=system,
+                base_controller=LQR(system, noise=0.0, seed=args.seed),
+                excitation_controller=RandomExcitationController(
+                    system=system,
+                    amplitude=args.deepc_random_excitation_amplitude,
+                    seed=args.seed,
+                ),
+            )
+        elif args.deepc_initial_controller == "lqr_prbs":
+            initial_controller = AdditiveExcitationController(
+                system=system,
+                base_controller=LQR(system, noise=0.0, seed=args.seed),
+                excitation_controller=PRBSExcitationController(
+                    system=system,
+                    amplitude=args.deepc_random_excitation_amplitude,
+                    hold_steps=args.deepc_prbs_hold_steps,
+                    seed=args.seed,
+                ),
+            )
         elif args.deepc_initial_controller == "mpc":
             initial_controller = LinearMPC(
                 system=system,
@@ -238,6 +259,7 @@ def build_controller(args, system, trajectory):
             block_lambda_position=args.deepc_block_lambda_position,
             data_length_extra=args.deepc_data_length_extra,
             history_alignment=args.deepc_history_alignment,
+            iv_projection_lag=args.deepc_iv_projection_lag,
             consistency_gate_lambda=args.deepc_consistency_gate_lambda,
             consistency_gate_clip=args.deepc_consistency_gate_clip,
             consistency_gate_eps=args.deepc_consistency_gate_eps,
@@ -385,6 +407,7 @@ def run_single_experiment(args):
             "solver": args.deepc_solver,
             "initial_controller": args.deepc_initial_controller,
             "random_excitation_amplitude": args.deepc_random_excitation_amplitude,
+            "prbs_hold_steps": int(args.deepc_prbs_hold_steps),
             "regularization_mode": args.deepc_regularization_mode,
             "attitude_slack_weight": args.deepc_attitude_slack_weight,
             "position_slack_weight": args.deepc_position_slack_weight,
@@ -397,12 +420,14 @@ def run_single_experiment(args):
             "block_lambda_position": args.deepc_block_lambda_position,
             "data_length_extra": args.deepc_data_length_extra,
             "history_alignment": args.deepc_history_alignment,
+            "iv_projection_lag": int(args.deepc_iv_projection_lag),
             "consistency_gate_lambda": args.deepc_consistency_gate_lambda,
             "consistency_gate_clip": args.deepc_consistency_gate_clip,
             "consistency_gate_eps": args.deepc_consistency_gate_eps,
             "effective_sigma_y_weights": np.asarray(controller.sigma_y_group_weights.value).reshape(-1).tolist(),
             "residual_stat_summary": controller.residual_stat_summary,
             "consistency_gate_summary": controller.consistency_gate_summary,
+            "iv_projection_summary": controller.iv_projection_summary,
             "data_length_T": int(controller.T),
             "latest_measurement_metadata": controller.latest_measurement_metadata,
             "bank_mode": getattr(controller, "bank_mode", "single_bank"),
@@ -473,8 +498,9 @@ def build_parser():
     parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1.0e4)
     parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=30.0)
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
-    parser.add_argument("--deepc-initial-controller", choices=["lqr", "mpc", "random"], default="lqr")
+    parser.add_argument("--deepc-initial-controller", choices=["lqr", "lqr_random", "lqr_prbs", "mpc", "random"], default="lqr")
     parser.add_argument("--deepc-random-excitation-amplitude", type=float, default=0.15)
+    parser.add_argument("--deepc-prbs-hold-steps", type=int, default=5)
     parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise", "residual_stats", "residual_variance", "residual_bias_variance", "robust_residual_stats", "block_l2", "yaw_selective_slack", "drop_yaw_past"], default="uniform")
     parser.add_argument("--deepc-attitude-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-position-slack-weight", type=float, default=1.0)
@@ -513,7 +539,8 @@ def build_parser():
     parser.add_argument("--measurement-async-period-steps", default="1,1,1,1,1,1")
     parser.add_argument("--measurement-burst-dropout-rate", type=float, default=0.0)
     parser.add_argument("--measurement-burst-dropout-length", type=int, default=0)
-    parser.add_argument("--deepc-history-alignment", choices=["naive", "delay_ref_only", "time_aligned", "suffix_aligned", "consistency_gated_time_aligned", "async_masked"], default="naive")
+    parser.add_argument("--deepc-history-alignment", choices=["naive", "delay_ref_only", "time_aligned", "suffix_aligned", "consistency_gated_time_aligned", "async_masked", "iv_projected"], default="naive")
+    parser.add_argument("--deepc-iv-projection-lag", type=int, default=1)
     parser.add_argument("--deepc-consistency-gate-lambda", type=float, default=3.0)
     parser.add_argument("--deepc-consistency-gate-clip", type=float, default=3.0)
     parser.add_argument("--deepc-consistency-gate-eps", type=float, default=1.0e-6)

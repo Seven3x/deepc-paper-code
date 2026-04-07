@@ -24,6 +24,7 @@ class DeePC:
         block_lambda_position=None,
         data_length_extra=0,
         history_alignment="naive",
+        iv_projection_lag=1,
         consistency_gate_lambda=3.0,
         consistency_gate_clip=3.0,
         consistency_gate_eps=1.0e-6,
@@ -80,6 +81,8 @@ class DeePC:
         self.residual_stat_summary = None
         self.consistency_gate_summary = None
         self.history_alignment = history_alignment
+        self.iv_projection_lag = max(int(iv_projection_lag), 1)
+        self.iv_projection_summary = None
         self.consistency_gate_lambda = consistency_gate_lambda
         self.consistency_gate_clip = consistency_gate_clip
         self.consistency_gate_eps = consistency_gate_eps
@@ -182,6 +185,8 @@ class DeePC:
     def create_and_partition_hankel_matrices(self):
         U_d = self.construct_hankel_matrix(self.u_d, self.T_ini + self.N)
         Y_d = self.construct_hankel_matrix(self.y_d, self.T_ini + self.N)
+        if self.history_alignment == "iv_projected":
+            U_d, Y_d = self._apply_iv_projection(U_d, Y_d)
 
         self.U_p.value = U_d[:self.m*self.T_ini,:]
         self.U_f.value = U_d[self.m*self.T_ini:,:]
@@ -202,6 +207,35 @@ class DeePC:
             self.sigma_y_group_weights.value = self._compute_robust_residual_stat_weights()
 
         print("Hankel matrices created and partitioned.")
+
+    def _apply_iv_projection(self, U_d, Y_d):
+        lag = self.iv_projection_lag
+        order = self.T_ini + self.N
+        u_lagged = self._lagged_signal_matrix(self.u_d, lag)
+        y_lagged = self._lagged_signal_matrix(self.y_d, lag)
+        Z_u = self.construct_hankel_matrix(u_lagged, order)
+        Z_y = self.construct_hankel_matrix(y_lagged, order)
+        Z = np.vstack((Z_u, Z_y))
+        gram = Z @ Z.T
+        projection = Z.T @ np.linalg.pinv(gram) @ Z
+        self.iv_projection_summary = {
+            "lag": int(lag),
+            "instrument_rows": int(Z.shape[0]),
+            "instrument_rank": int(np.linalg.matrix_rank(Z)),
+            "projection_rank": int(np.linalg.matrix_rank(projection)),
+            "num_columns": int(U_d.shape[1]),
+        }
+        return U_d @ projection, Y_d @ projection
+
+    def _lagged_signal_matrix(self, data, lag):
+        array = np.asarray(data, dtype=float)
+        if array.ndim != 2:
+            raise ValueError(f"Expected a 2D signal matrix, got shape {array.shape}")
+        if lag <= 0:
+            return array
+        prefix = np.repeat(array[:, :1], lag, axis=1)
+        suffix = array[:, :-lag] if array.shape[1] > lag else np.empty((array.shape[0], 0))
+        return np.hstack((prefix, suffix))
 
     def setup_constraints(self):
         # Equality constraint
