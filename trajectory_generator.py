@@ -115,7 +115,50 @@ class TrajectoryGenerator:
             ref[-3:, mask] = corner.reshape(-1,1)
 
         return ref
-    
+
+    def generate_box_sweep_reference(self, duration=20.0):
+        """
+        Generate a smooth box sweep reference that linearly interpolates
+        between corners instead of jumping across them.
+        """
+        corners = [
+            np.array([0.0, 0.0, 0.0]),
+            np.array([1.0, 1.0, 0.0]),
+            np.array([1.0, 1.0, -1.0]),
+            np.array([1.0, -1.0, -1.0]),
+            np.array([-1.0, -1.0, -1.0]),
+            np.array([-1.0, -1.0, 0.0]),
+            np.array([0.0, 0.0, 0.0]),
+        ]
+
+        Ts = self.system.h
+        t = np.arange(0, duration, Ts)
+        ref = np.zeros((self.system.p, len(t)))
+        if len(t) == 0:
+            return ref
+
+        segment_count = len(corners) - 1
+        segment_duration = duration / max(segment_count, 1)
+
+        for seg in range(segment_count):
+            start_t = seg * segment_duration
+            end_t = (seg + 1) * segment_duration
+            if seg == segment_count - 1:
+                mask = (t >= start_t) & (t <= end_t)
+            else:
+                mask = (t >= start_t) & (t < end_t)
+            if not np.any(mask):
+                continue
+            local_alpha = (t[mask] - start_t) / max(segment_duration, Ts)
+            local_alpha = np.clip(local_alpha, 0.0, 1.0)
+            start_corner = corners[seg].reshape(3, 1)
+            end_corner = corners[seg + 1].reshape(3, 1)
+            interp = start_corner @ np.ones((1, local_alpha.size)) * (1.0 - local_alpha)
+            interp += end_corner @ np.ones((1, local_alpha.size)) * local_alpha
+            ref[-3:, mask] = interp
+
+        return ref
+
     def initial_reference(self, length):
         '''
         Generate an initial reference trajectory to help excite the system.
@@ -127,6 +170,9 @@ class TrajectoryGenerator:
             numpy.ndarray: Initial reference trajectory of shape (p, length).
         '''
 
+        if self.sort == 'box':
+            return self.generate_box_sweep_reference(duration=self.system.h * length)
+
         ref = self.extend_reference(self.output_reference[:,0].reshape(-1,1), length)
         time = np.linspace(0, self.system.h * length, length)
 
@@ -135,10 +181,14 @@ class TrajectoryGenerator:
             ref[1, :] = 0.12 * np.sign(np.sin(2 * np.pi * 0.17 * time + np.pi / 3))
             ref[2, :] = 0.10 * np.sign(np.sin(2 * np.pi * 0.21 * time))
         else:
-            z_freq = 0.2
-            sin_signal = np.sin(2*np.pi*z_freq*time)
-            z_ref = 0.1*np.sign(sin_signal)
-            ref[-1, :] = z_ref
+            yaw_ref = 0.10 * np.sin(2 * np.pi * 0.11 * time)
+            x_ref = 0.15 * np.sign(np.sin(2 * np.pi * 0.13 * time))
+            y_ref = 0.12 * np.sign(np.sin(2 * np.pi * 0.17 * time + np.pi / 3))
+            z_ref = 0.10 * np.sign(np.sin(2 * np.pi * 0.21 * time))
+            ref[2, :] = yaw_ref
+            ref[3, :] = x_ref
+            ref[4, :] = y_ref
+            ref[5, :] = z_ref
 
         return ref
     
