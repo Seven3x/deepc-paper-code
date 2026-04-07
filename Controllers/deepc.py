@@ -218,14 +218,30 @@ class DeePC:
         Z = np.vstack((Z_u, Z_y))
         gram = Z @ Z.T
         projection = Z.T @ np.linalg.pinv(gram) @ Z
+        U_proj = U_d @ projection
+        Y_proj = Y_d @ projection
+        H_raw = np.vstack((U_d, Y_d))
+        H_proj = np.vstack((U_proj, Y_proj))
+        eye = np.eye(projection.shape[0])
+
+        def _safe_rel_diff(new_value, old_value):
+            denom = np.linalg.norm(old_value)
+            if denom <= 1e-12:
+                return 0.0
+            return float(np.linalg.norm(new_value - old_value) / denom)
+
         self.iv_projection_summary = {
             "lag": int(lag),
             "instrument_rows": int(Z.shape[0]),
             "instrument_rank": int(np.linalg.matrix_rank(Z)),
             "projection_rank": int(np.linalg.matrix_rank(projection)),
             "num_columns": int(U_d.shape[1]),
+            "projection_identity_rel": _safe_rel_diff(projection, eye),
+            "u_rel_change": _safe_rel_diff(U_proj, U_d),
+            "y_rel_change": _safe_rel_diff(Y_proj, Y_d),
+            "h_rel_change": _safe_rel_diff(H_proj, H_raw),
         }
-        return U_d @ projection, Y_d @ projection
+        return U_proj, Y_proj
 
     def _lagged_signal_matrix(self, data, lag):
         array = np.asarray(data, dtype=float)

@@ -13,6 +13,7 @@ from Controllers.lqr_tracking import LQRTrackingController
 from Controllers.lqr import LQR
 from Controllers.prbs_excitation import PRBSExcitationController
 from Controllers.random_excitation import RandomExcitationController
+from Controllers.reference_probe_excitation import ReferenceProbeExcitationController
 from Simulator.simulation import Simulation, SimulationPlotter
 from hdf5_reader import HDF5Reader
 from paths import RESULTS_DIR, ensure_output_dirs
@@ -223,6 +224,16 @@ def build_controller(args, system, trajectory):
                     hold_steps=args.deepc_prbs_hold_steps,
                     seed=args.seed,
                 ),
+            )
+        elif args.deepc_initial_controller == "lqr_refprobe":
+            initial_controller = ReferenceProbeExcitationController(
+                system=system,
+                base_controller=LQR(system, noise=0.0, seed=args.seed),
+                sampling_time=system.h,
+                position_amplitude=args.deepc_refprobe_position_amplitude,
+                z_amplitude=args.deepc_refprobe_z_amplitude,
+                yaw_amplitude=args.deepc_refprobe_yaw_amplitude,
+                seed=args.seed,
             )
         elif args.deepc_initial_controller == "mpc":
             initial_controller = LinearMPC(
@@ -498,9 +509,12 @@ def build_parser():
     parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1.0e4)
     parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=30.0)
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
-    parser.add_argument("--deepc-initial-controller", choices=["lqr", "lqr_random", "lqr_prbs", "mpc", "random"], default="lqr")
+    parser.add_argument("--deepc-initial-controller", choices=["lqr", "lqr_random", "lqr_prbs", "lqr_refprobe", "mpc", "random"], default="lqr")
     parser.add_argument("--deepc-random-excitation-amplitude", type=float, default=0.15)
     parser.add_argument("--deepc-prbs-hold-steps", type=int, default=5)
+    parser.add_argument("--deepc-refprobe-position-amplitude", type=float, default=0.12)
+    parser.add_argument("--deepc-refprobe-z-amplitude", type=float, default=0.08)
+    parser.add_argument("--deepc-refprobe-yaw-amplitude", type=float, default=0.20)
     parser.add_argument("--deepc-regularization-mode", choices=["uniform", "manual_grouped", "manual_output", "measurement_noise", "residual_stats", "residual_variance", "residual_bias_variance", "robust_residual_stats", "block_l2", "yaw_selective_slack", "drop_yaw_past"], default="uniform")
     parser.add_argument("--deepc-attitude-slack-weight", type=float, default=1.0)
     parser.add_argument("--deepc-position-slack-weight", type=float, default=1.0)
