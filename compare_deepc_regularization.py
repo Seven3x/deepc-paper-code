@@ -3,6 +3,7 @@ import csv
 import json
 from copy import deepcopy
 from datetime import datetime
+import numpy as np
 
 from paths import RESULTS_DIR, ensure_output_dirs
 from run_experiment import build_parser, run_single_experiment
@@ -31,12 +32,16 @@ def parse_csv_list(raw):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def parse_int_list(raw):
+    return [int(item.strip()) for item in raw.split(",") if item.strip()]
+
+
 def make_args(base_args, trajectory, scenario_name, variant_name, suite_name, args):
     run_args = deepcopy(base_args)
     run_args.trajectory = trajectory
     run_args.tag = f"{suite_name}_{scenario_name}_{variant_name}_{trajectory}"
     run_args.output_set = "xyzpsi"
-    run_args.deepc_data_length_extra = 0
+    run_args.deepc_data_length_extra = args.deepc_data_length_extra
 
     scenario = SCENARIOS[scenario_name]
     run_args.measurement_noise_std = scenario["measurement_noise_std"]
@@ -44,13 +49,13 @@ def make_args(base_args, trajectory, scenario_name, variant_name, suite_name, ar
     run_args.measurement_yaw_drift_per_sec = scenario["measurement_yaw_drift_per_sec"]
 
     if trajectory == "step":
-        run_args.lqr_noise = 0.02
+        run_args.lqr_noise = args.lqr_noise
         run_args.deepc_T_ini = 8
         run_args.deepc_N = 10
         run_args.deepc_lambda_y = 1000.0
         run_args.deepc_lambda_g = 10.0
     else:
-        run_args.lqr_noise = 0.02
+        run_args.lqr_noise = args.lqr_noise
         run_args.deepc_T_ini = 4
         run_args.deepc_N = 10
         run_args.deepc_lambda_y = 300.0
@@ -103,13 +108,14 @@ def make_args(base_args, trajectory, scenario_name, variant_name, suite_name, ar
         run_args.deepc_output_slack_weights = "1,1,1,1,1,1"
     elif variant_name == "xyz_only":
         run_args.output_set = "xyz"
-        run_args.deepc_initial_controller = "random"
+        run_args.deepc_initial_controller = args.xyz_initial_controller
+        run_args.lqr_noise = args.lqr_noise
         run_args.deepc_random_excitation_amplitude = args.xyz_random_excitation_amplitude
         run_args.deepc_regularization_mode = "uniform"
         run_args.deepc_attitude_slack_weight = 1.0
         run_args.deepc_position_slack_weight = 1.0
         run_args.deepc_output_slack_weights = "1,1,1"
-        run_args.deepc_data_length_extra = 100
+        run_args.deepc_data_length_extra = args.xyz_data_length_extra
     else:
         raise ValueError(variant_name)
 
@@ -126,6 +132,37 @@ def classify(result, thresholds):
     )
 
 
+def aggregate(rows):
+    grouped = {}
+    for row in rows:
+        key = (row["scenario"], row["trajectory"], row["variant"])
+        grouped.setdefault(key, []).append(row)
+
+    summary = []
+    for (scenario, trajectory, variant), items in grouped.items():
+        rmse_position = np.asarray([item["metrics"]["rmse_position"] for item in items], dtype=float)
+        rmse_yaw = np.asarray([item["metrics"]["rmse_yaw"] for item in items], dtype=float)
+        final_position = np.asarray([item["metrics"]["final_position_error_norm"] for item in items], dtype=float)
+        success = np.asarray([1.0 if item["stable"] else 0.0 for item in items], dtype=float)
+        summary.append(
+            {
+                "scenario": scenario,
+                "trajectory": trajectory,
+                "variant": variant,
+                "num_seeds": len(items),
+                "rmse_position_mean": float(np.mean(rmse_position)),
+                "rmse_position_std": float(np.std(rmse_position)),
+                "rmse_yaw_mean": float(np.mean(rmse_yaw)),
+                "rmse_yaw_std": float(np.std(rmse_yaw)),
+                "final_position_error_norm_mean": float(np.mean(final_position)),
+                "final_position_error_norm_std": float(np.std(final_position)),
+                "success_rate": float(np.mean(success)),
+            }
+        )
+    summary.sort(key=lambda item: (item["scenario"], item["trajectory"], item["variant"]))
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compare DeePC regularization variants under measurement mismatch.")
     parser.add_argument("--reference-duration", type=float, default=6.0)
@@ -133,6 +170,8 @@ def main():
     parser.add_argument("--dt", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--measurement-seed", type=int, default=0)
+    parser.add_argument("--seeds", default="")
+    parser.add_argument("--measurement-seeds", default="")
     parser.add_argument("--trajectories", default="step,figure8")
     parser.add_argument("--scenarios", default="nominal,yaw_drift,anisotropic_noise")
     parser.add_argument("--variants", default="uniform,manual_grouped")
@@ -143,6 +182,10 @@ def main():
     parser.add_argument("--block-lambda-yaw", type=float, default=250.0)
     parser.add_argument("--block-lambda-position", type=float, default=1000.0)
     parser.add_argument("--xyz-random-excitation-amplitude", type=float, default=0.2)
+    parser.add_argument("--xyz-initial-controller", choices=["lqr", "random", "mpc"], default="lqr")
+    parser.add_argument("--lqr-noise", type=float, default=0.05)
+    parser.add_argument("--deepc-data-length-extra", type=int, default=30)
+    parser.add_argument("--xyz-data-length-extra", type=int, default=30)
     parser.add_argument("--max-position-error", type=float, default=2.0)
     parser.add_argument("--max-yaw-error", type=float, default=1.0)
     parser.add_argument("--max-final-position-error", type=float, default=2.0)
@@ -169,22 +212,32 @@ def main():
     trajectories = parse_csv_list(args.trajectories)
     scenarios = parse_csv_list(args.scenarios)
     variants = parse_csv_list(args.variants)
+    seeds = parse_int_list(args.seeds) if args.seeds else [args.seed]
+    measurement_seeds = parse_int_list(args.measurement_seeds) if args.measurement_seeds else seeds
+    if len(measurement_seeds) != len(seeds):
+        raise ValueError("--measurement-seeds must match --seeds length when provided")
     rows = []
 
-    for scenario_name in scenarios:
-        if scenario_name not in SCENARIOS:
-            raise ValueError(f"Unknown scenario: {scenario_name}")
-        for trajectory in trajectories:
-            for variant_name in variants:
-                run_args = make_args(base_args, trajectory, scenario_name, variant_name, suite_name, args)
-                result = run_single_experiment(run_args)
-                result["stable"] = classify(result, args)
-                result["scenario"] = scenario_name
-                result["variant"] = variant_name
-                rows.append(result)
+    for seed, measurement_seed in zip(seeds, measurement_seeds):
+        for scenario_name in scenarios:
+            if scenario_name not in SCENARIOS:
+                raise ValueError(f"Unknown scenario: {scenario_name}")
+            for trajectory in trajectories:
+                for variant_name in variants:
+                    run_args = make_args(base_args, trajectory, scenario_name, variant_name, suite_name, args)
+                    run_args.seed = seed
+                    run_args.measurement_seed = measurement_seed
+                    run_args.tag = f"{suite_name}_seed{seed}_{scenario_name}_{variant_name}_{trajectory}"
+                    result = run_single_experiment(run_args)
+                    result["stable"] = classify(result, args)
+                    result["scenario"] = scenario_name
+                    result["variant"] = variant_name
+                    rows.append(result)
+
+    aggregate_rows = aggregate(rows)
 
     with open(suite_dir / "summary.json", "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2, ensure_ascii=False)
+        json.dump({"runs": rows, "aggregate": aggregate_rows}, f, indent=2, ensure_ascii=False)
 
     with open(suite_dir / "summary.csv", "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -219,24 +272,58 @@ def main():
                 json.dumps(row["measurement"], ensure_ascii=False),
             ])
 
+    with open(suite_dir / "aggregate.csv", "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "scenario",
+            "trajectory",
+            "variant",
+            "num_seeds",
+            "rmse_position_mean",
+            "rmse_position_std",
+            "rmse_yaw_mean",
+            "rmse_yaw_std",
+            "final_position_error_norm_mean",
+            "final_position_error_norm_std",
+            "success_rate",
+        ])
+        for row in aggregate_rows:
+            writer.writerow([
+                row["scenario"],
+                row["trajectory"],
+                row["variant"],
+                row["num_seeds"],
+                row["rmse_position_mean"],
+                row["rmse_position_std"],
+                row["rmse_yaw_mean"],
+                row["rmse_yaw_std"],
+                row["final_position_error_norm_mean"],
+                row["final_position_error_norm_std"],
+                row["success_rate"],
+            ])
+
     lines = [
         f"# DeePC Regularization Compare: {suite_name}",
         "",
         f"- reference_duration: {args.reference_duration}",
-        f"- seed: {args.seed}",
-        f"- measurement_seed: {args.measurement_seed}",
+        f"- seeds: {', '.join(str(seed) for seed in seeds)}",
+        f"- measurement_seeds: {', '.join(str(seed) for seed in measurement_seeds)}",
         f"- manual_attitude_weight: {args.manual_attitude_weight}",
         f"- manual_position_weight: {args.manual_position_weight}",
+        f"- lqr_noise: {args.lqr_noise}",
         "",
-        "| Scenario | Trajectory | Variant | Stable | RMSE Pos | RMSE Yaw | Final Pos Err | Max Pos Err |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: |",
+        "## Aggregate",
+        "",
+        "| Scenario | Trajectory | Variant | Seeds | RMSE Pos Mean ± Std | RMSE Yaw Mean ± Std | Final Pos Mean ± Std | Success Rate |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for row in rows:
-        metrics = row["metrics"]
+    for row in aggregate_rows:
         lines.append(
-            f"| {row['scenario']} | {row['trajectory']} | {row['variant']} | {row['stable']} | "
-            f"{metrics['rmse_position']:.4f} | {metrics['rmse_yaw']:.4f} | "
-            f"{metrics['final_position_error_norm']:.4f} | {metrics['max_abs_position_error']:.4f} |"
+            f"| {row['scenario']} | {row['trajectory']} | {row['variant']} | {row['num_seeds']} | "
+            f"{row['rmse_position_mean']:.4f} ± {row['rmse_position_std']:.4f} | "
+            f"{row['rmse_yaw_mean']:.4f} ± {row['rmse_yaw_std']:.4f} | "
+            f"{row['final_position_error_norm_mean']:.4f} ± {row['final_position_error_norm_std']:.4f} | "
+            f"{row['success_rate']:.2f} |"
         )
 
     with open(suite_dir / "summary.md", "w", encoding="utf-8") as f:
