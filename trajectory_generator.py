@@ -96,25 +96,7 @@ class TrajectoryGenerator:
         Returns:
             numpy.ndarray: Box trajectory of shape (p, num_samples).
         """
-        corners = [np.array([0, 0, 0]),
-                   np.array([1, 1, 0]),
-                   np.array([1, 1, -1]),
-                   np.array([1, -1, -1]),
-                   np.array([-1, -1, -1]),
-                   np.array([-1, -1, 0]),
-                   np.array([0, 0, 0])]
-    
-        Ts = self.system.h
-        t = np.arange(0, duration, Ts)
-        step_time_interval = duration / len(corners)
-
-        ref = np.zeros((self.system.p, len(t)))
-
-        for i, corner in enumerate(corners):
-            mask = (t >= step_time_interval * i) & (t < step_time_interval * (i + 1))
-            ref[-3:, mask] = corner.reshape(-1,1)
-
-        return ref
+        return self.generate_box_sweep_reference(duration=duration)
 
     def generate_box_sweep_reference(self, duration=20.0):
         """
