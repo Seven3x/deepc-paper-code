@@ -238,14 +238,14 @@ class SimulationPlotter:
         self.discrete_time = result["discrete time"]
         self.x_data = result["x"]
         self.u_data = result["u"]
-        self.y_data = result["y"]
+        self.y_data = result.get("y_true", result["y"])
 
         # Number of states, inputs, and outputs
         n = self.x_data.shape[0]
         m = self.u_data.shape[0]
         p = self.y_data.shape[0]
 
-        total_discrete_data_points = result["y"].shape[1]
+        total_discrete_data_points = self.y_data.shape[1]
 
         self.traj = None
 

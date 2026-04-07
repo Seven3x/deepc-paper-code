@@ -43,8 +43,8 @@ class DeePC:
         self.p = system.p
         self.bank_mode = "dual_bank"
         self.controller_health_mode = str(controller_health_mode)
-        if self.controller_health_mode not in {"nominal", "degraded"}:
-            raise ValueError("controller_health_mode must be nominal or degraded")
+        if self.controller_health_mode not in {"nominal", "degraded", "health_gate"}:
+            raise ValueError("controller_health_mode must be nominal, degraded, or health_gate")
         self.bank_selection_mode = str(bank_selection_mode)
         if self.bank_selection_mode not in {"fixed", "oracle_minimal"}:
             raise ValueError("bank_selection_mode must be fixed or oracle_minimal")
@@ -499,8 +499,12 @@ class DeePC:
             optimization_reference_step = measurement_packet["source_step"]
             control_offset = measurement_packet["delay_steps"]
         elif self.history_alignment == "async_masked":
-            optimization_reference_step = self._effective_reference_step(measurement_packet)
-            control_offset = max(0, measurement_packet["delivered_step"] - optimization_reference_step)
+            # Keep the masked/slot-aligned history, but anchor the optimization
+            # to the current control step. In delay-only Track 1 scenarios,
+            # rewinding both the reference window and the control index to the
+            # delayed source step over-compensates and destabilizes the baseline.
+            optimization_reference_step = measurement_packet["delivered_step"]
+            control_offset = 0
         else:
             optimization_reference_step = measurement_packet["delivered_step"]
             control_offset = 0
@@ -790,6 +794,8 @@ class DeePC:
     def _desired_health_mode(self):
         if self.controller_health_mode == "nominal":
             return "nominal"
+        if self.controller_health_mode == "health_gate":
+            return self._plant_health_mode()
         return self._plant_health_mode()
 
     def _select_control_bank(self, desired_health_mode, x_current=None, measurement_packet=None, measurement_residual=None):
@@ -1038,6 +1044,14 @@ class DeePC:
             slot = self.async_source_slots[source_step]
             if slot["u"] is None:
                 break
+            # For async/dropout data, only train the Hankel bank on fully
+            # observed source slots. Partially observed slots still help the
+            # online masked history constraints, but pushing hold-last-filled
+            # rows into the training bank contaminates the naive baseline under
+            # burst dropout, especially on curved references.
+            if np.any(np.asarray(slot["mask"], dtype=float).reshape(self.p) < 0.5):
+                self.next_async_training_source_step += 1
+                continue
             self._append_training_pair(slot)
             self.next_async_training_source_step += 1
         

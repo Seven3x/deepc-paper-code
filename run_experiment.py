@@ -21,6 +21,27 @@ from quadcopter import Quadcopter
 from trajectory_generator import TrajectoryGenerator
 
 
+FROZEN_NAIVE_BASELINE = {
+    "controller": "deepc",
+    "output_set": "xyzpsi",
+    "lqr_noise": 0.05,
+    "deepc_T_ini": 8,
+    "deepc_N": 10,
+    "deepc_lambda_y": 1000.0,
+    "deepc_lambda_g": 10.0,
+    "deepc_data_length_extra": 30,
+    "deepc_initial_controller": "lqr",
+    "deepc_history_alignment": "naive",
+    "deepc_health_mode": "nominal",
+}
+
+NAIVE_BASELINE_SANITY_CASES = (
+    {"trajectory": "step", "reference_duration": 6.0, "rmse_position_threshold": 0.5},
+    {"trajectory": "figure8", "reference_duration": 6.0, "rmse_position_threshold": 0.5},
+    {"trajectory": "box", "reference_duration": 6.0, "rmse_position_threshold": 0.5},
+)
+
+
 def parse_float_list(raw):
     return [float(item.strip()) for item in raw.split(",") if item.strip()]
 
@@ -52,12 +73,19 @@ def build_measurement_config(args):
     }
 
 
+def apply_frozen_naive_baseline_args(args):
+    for key, value in FROZEN_NAIVE_BASELINE.items():
+        setattr(args, key, value)
+    return args
+
+
 def build_fault_config(args):
+    fault_health_mode = "nominal" if args.deepc_health_mode == "nominal" else "degraded"
     return {
         "mode": args.fault_mode,
         "rotor_index": args.fault_rotor_index,
         "efficiency_scale": args.fault_efficiency_scale,
-        "health_mode": args.deepc_health_mode,
+        "health_mode": fault_health_mode,
         "start_time": args.fault_start_time,
     }
 
@@ -497,19 +525,19 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Run a reproducible DeePC quadcopter experiment.")
     parser.add_argument("--controller", choices=["lqr", "mpc", "identified_mpc", "deepc"], required=True)
     parser.add_argument("--trajectory", choices=["constant", "figure8", "step", "box"], default="figure8")
-    parser.add_argument("--output-set", choices=["xyzpsi", "xyz"], default="xyzpsi")
+    parser.add_argument("--output-set", choices=["xyzpsi", "xyz"], default=FROZEN_NAIVE_BASELINE["output_set"])
     parser.add_argument("--reference-duration", type=float, default=12.0)
     parser.add_argument("--sampling-time", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--lqr-noise", type=float, default=0.05)
+    parser.add_argument("--lqr-noise", type=float, default=FROZEN_NAIVE_BASELINE["lqr_noise"])
     parser.add_argument("--disable-regularization", action="store_true")
     parser.add_argument("--dt", type=float, default=0.001)
-    parser.add_argument("--deepc-T-ini", dest="deepc_T_ini", type=int, default=8)
-    parser.add_argument("--deepc-N", dest="deepc_N", type=int, default=10)
-    parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=1000.0)
-    parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=10.0)
+    parser.add_argument("--deepc-T-ini", dest="deepc_T_ini", type=int, default=FROZEN_NAIVE_BASELINE["deepc_T_ini"])
+    parser.add_argument("--deepc-N", dest="deepc_N", type=int, default=FROZEN_NAIVE_BASELINE["deepc_N"])
+    parser.add_argument("--deepc-lambda-y", dest="deepc_lambda_y", type=float, default=FROZEN_NAIVE_BASELINE["deepc_lambda_y"])
+    parser.add_argument("--deepc-lambda-g", dest="deepc_lambda_g", type=float, default=FROZEN_NAIVE_BASELINE["deepc_lambda_g"])
     parser.add_argument("--deepc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
-    parser.add_argument("--deepc-initial-controller", choices=["lqr", "lqr_random", "lqr_prbs", "lqr_refprobe", "mpc", "random"], default="lqr")
+    parser.add_argument("--deepc-initial-controller", choices=["lqr", "lqr_random", "lqr_prbs", "lqr_refprobe", "mpc", "random"], default=FROZEN_NAIVE_BASELINE["deepc_initial_controller"])
     parser.add_argument("--deepc-random-excitation-amplitude", type=float, default=0.15)
     parser.add_argument("--deepc-prbs-hold-steps", type=int, default=5)
     parser.add_argument("--deepc-refprobe-position-amplitude", type=float, default=0.12)
@@ -528,7 +556,7 @@ def build_parser():
     parser.add_argument("--deepc-block-lambda-roll-pitch", type=float, default=None)
     parser.add_argument("--deepc-block-lambda-yaw", type=float, default=None)
     parser.add_argument("--deepc-block-lambda-position", type=float, default=None)
-    parser.add_argument("--deepc-data-length-extra", type=int, default=30)
+    parser.add_argument("--deepc-data-length-extra", type=int, default=FROZEN_NAIVE_BASELINE["deepc_data_length_extra"])
     parser.add_argument("--mpc-N", dest="mpc_N", type=int, default=10)
     parser.add_argument("--mpc-solver", choices=["CLARABEL", "ECOS", "SCS"], default="CLARABEL")
     parser.add_argument(
@@ -553,7 +581,7 @@ def build_parser():
     parser.add_argument("--measurement-async-period-steps", default="1,1,1,1,1,1")
     parser.add_argument("--measurement-burst-dropout-rate", type=float, default=0.0)
     parser.add_argument("--measurement-burst-dropout-length", type=int, default=0)
-    parser.add_argument("--deepc-history-alignment", choices=["naive", "delay_ref_only", "time_aligned", "suffix_aligned", "consistency_gated_time_aligned", "async_masked", "iv_projected"], default="naive")
+    parser.add_argument("--deepc-history-alignment", choices=["naive", "delay_ref_only", "time_aligned", "suffix_aligned", "consistency_gated_time_aligned", "async_masked", "iv_projected"], default=FROZEN_NAIVE_BASELINE["deepc_history_alignment"])
     parser.add_argument("--deepc-iv-projection-lag", type=int, default=1)
     parser.add_argument("--deepc-consistency-gate-lambda", type=float, default=3.0)
     parser.add_argument("--deepc-consistency-gate-clip", type=float, default=3.0)
@@ -562,7 +590,7 @@ def build_parser():
     parser.add_argument("--fault-rotor-index", type=int, default=0)
     parser.add_argument("--fault-efficiency-scale", type=float, default=1.0)
     parser.add_argument("--fault-start-time", type=float, default=0.0)
-    parser.add_argument("--deepc-health-mode", choices=["nominal", "degraded"], default="nominal")
+    parser.add_argument("--deepc-health-mode", choices=["nominal", "degraded", "health_gate"], default=FROZEN_NAIVE_BASELINE["deepc_health_mode"])
     parser.add_argument("--deepc-bank-selection", choices=["fixed", "oracle_minimal"], default="fixed")
     parser.add_argument(
         "--deepc-bank-transfer-mode",
