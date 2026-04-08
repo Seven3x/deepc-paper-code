@@ -306,6 +306,10 @@ def build_controller(args, system, trajectory):
             bank_selection_mode=args.deepc_bank_selection,
             bank_transfer_mode=args.deepc_bank_transfer_mode,
             bank_transfer_interval_steps=args.deepc_bank_transfer_interval_steps,
+            objective_variant=args.deepc_objective_variant,
+            late_position_weight=args.deepc_late_position_weight,
+            async_bootstrap_mode=args.deepc_async_bootstrap_mode,
+            local_input_excitation_quantile=args.deepc_local_input_excitation_quantile,
         )
 
     if args.controller == "mpc":
@@ -319,7 +323,7 @@ def build_controller(args, system, trajectory):
     raise ValueError(f"Unsupported controller: {args.controller}")
 
 
-def compute_metrics(result, trajectory, system, eval_start_step=0, eval_num_steps=None):
+def compute_metrics(result, trajectory, system, eval_start_step=0, eval_num_steps=None, controller=None):
     y_eval_full = result.get("y_true", result["y"])
     total_steps = y_eval_full.shape[1]
     ref_full = trajectory.extend_reference(trajectory.output_reference, total_steps)[:, :total_steps]
@@ -353,12 +357,41 @@ def compute_metrics(result, trajectory, system, eval_start_step=0, eval_num_step
         "rmse_all_outputs": float(np.sqrt(np.mean(np.square(err)))),
         "rmse_position": float(np.sqrt(np.mean(np.square(pos_err)))),
         "rmse_yaw": float(np.sqrt(np.mean(np.square(yaw_err)))),
+        "p95_position_error_norm": float(np.percentile(np.linalg.norm(pos_err, axis=0), 95)),
+        "max_position_error_norm": float(np.max(np.linalg.norm(pos_err, axis=0))),
         "final_position_error_norm": float(np.linalg.norm(pos_err[:, -1])),
         "max_abs_position_error": float(np.max(np.abs(pos_err))),
         "max_abs_yaw_error": float(np.max(np.abs(yaw_err))),
         "has_yaw_output": has_yaw_output,
         "all_finite": bool(np.isfinite(y_eval).all()),
     }
+    if controller is not None and hasattr(controller, "qp_step_records"):
+        eval_records = [
+            record for record in controller.qp_step_records
+            if start <= int(record["step"]) < stop
+        ]
+        if eval_records:
+            qp_online = np.asarray([1.0 if record["qp_online"] else 0.0 for record in eval_records], dtype=float)
+            pe_online = np.asarray([1.0 if record["pe_online"] else 0.0 for record in eval_records], dtype=float)
+            first_qp_step = next(
+                (int(record["step"]) for record in eval_records if record["qp_online"]),
+                None,
+            )
+            metrics.update(
+                {
+                    "qp_online_ratio": float(np.mean(qp_online)),
+                    "first_qp_step": first_qp_step,
+                    "pe_online_ratio": float(np.mean(pe_online)),
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "qp_online_ratio": 0.0,
+                    "first_qp_step": None,
+                    "pe_online_ratio": 0.0,
+                }
+            )
     return metrics
 
 
@@ -412,6 +445,7 @@ def run_single_experiment(args):
         system,
         eval_start_step=task_start_steps,
         eval_num_steps=eval_num_steps,
+        controller=controller,
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -475,6 +509,10 @@ def run_single_experiment(args):
             "bank_selection_mode": getattr(controller, "bank_selection_mode", "fixed"),
             "bank_transfer_mode": getattr(controller, "bank_transfer_mode", "none"),
             "bank_transfer_interval_steps": int(getattr(controller, "bank_transfer_interval_steps", 1)),
+            "objective_variant": args.deepc_objective_variant,
+            "late_position_weight": float(args.deepc_late_position_weight),
+            "async_bootstrap_mode": args.deepc_async_bootstrap_mode,
+            "local_input_excitation_quantile": float(args.deepc_local_input_excitation_quantile),
             "plant_health_mode": getattr(controller, "plant_health_mode", "nominal"),
             "requested_bank_name": getattr(controller, "requested_bank_name", getattr(controller, "health_mode", "nominal")),
             "control_bank_name": getattr(controller, "control_bank_name", getattr(controller, "health_mode", "nominal")),
@@ -482,6 +520,30 @@ def run_single_experiment(args):
             "candidate_bank_scores": getattr(controller, "candidate_bank_scores", {}),
             "degraded_bank_bootstrapped": getattr(controller, "degraded_bank_bootstrapped", False),
             "degraded_bank_adaptation_steps": int(getattr(controller, "degraded_bank_adaptation_steps", 0)),
+            "formal_hankel_column_count": int(
+                len(controller.u_d) if isinstance(controller.u_d, list) else controller.u_d.shape[1]
+            ),
+            "bootstrap_hankel_column_count": int(
+                len(controller.bootstrap_u_d) if isinstance(controller.bootstrap_u_d, list) else controller.bootstrap_u_d.shape[1]
+            ),
+            "bootstrap_partial_slot_count": int(getattr(controller, "bootstrap_partial_slot_count", 0)),
+            "bootstrap_total_slot_count": int(getattr(controller, "bootstrap_total_slot_count", 0)),
+            "formal_bank_accepts_partial": False,
+            "bootstrap_contamination_ratio": (
+                0.0
+                if int(getattr(controller, "bootstrap_total_slot_count", 0)) == 0
+                else float(getattr(controller, "bootstrap_partial_slot_count", 0))
+                / float(getattr(controller, "bootstrap_total_slot_count", 0))
+            ),
+            "bootstrap_partial_excitation_scores_accepted": list(
+                getattr(controller, "bootstrap_partial_excitation_scores_accepted", [])
+            ),
+            "bootstrap_partial_excitation_scores_rejected": list(
+                getattr(controller, "bootstrap_partial_excitation_scores_rejected", [])
+            ),
+            "bootstrap_excitation_thresholds": list(
+                getattr(controller, "bootstrap_excitation_thresholds", [])
+            ),
         }
     if args.controller == "mpc":
         output["mpc"] = {
@@ -586,6 +648,24 @@ def build_parser():
     parser.add_argument("--deepc-consistency-gate-lambda", type=float, default=3.0)
     parser.add_argument("--deepc-consistency-gate-clip", type=float, default=3.0)
     parser.add_argument("--deepc-consistency-gate-eps", type=float, default=1.0e-6)
+    parser.add_argument("--deepc-objective-variant", choices=["baseline", "late_horizon_weight"], default="baseline")
+    parser.add_argument("--deepc-late-position-weight", type=float, default=3.0)
+    parser.add_argument(
+        "--deepc-async-bootstrap-mode",
+        choices=[
+            "full_only",
+            "obs_ge4",
+            "pos2_obs4",
+            "bootstrap_only_partial",
+            "recent_consistent_partial_bootstrap",
+            "bounded_stale_partial_bootstrap",
+            "bounded_stale_minlen_bootstrap",
+            "xy_full_minlen_bootstrap",
+            "local_input_excitation_bootstrap",
+        ],
+        default="full_only",
+    )
+    parser.add_argument("--deepc-local-input-excitation-quantile", type=float, default=50.0)
     parser.add_argument("--fault-mode", choices=["nominal", "single_rotor_efficiency_drop"], default="nominal")
     parser.add_argument("--fault-rotor-index", type=int, default=0)
     parser.add_argument("--fault-efficiency-scale", type=float, default=1.0)

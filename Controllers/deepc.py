@@ -32,6 +32,10 @@ class DeePC:
         bank_selection_mode="fixed",
         bank_transfer_mode="none",
         bank_transfer_interval_steps=10,
+        objective_variant="baseline",
+        late_position_weight=1.0,
+        async_bootstrap_mode="full_only",
+        local_input_excitation_quantile=50.0,
     ):
         '''Initialize DeePC controller'''
 
@@ -64,6 +68,32 @@ class DeePC:
         self.degraded_bank_adaptation_steps = 0
         self.yaw_output_rows = [row for row, idx in enumerate(system.output_indices) if idx == 2]
         self.non_yaw_output_rows = [row for row in range(self.p) if row not in self.yaw_output_rows]
+        self.position_output_rows = [row for row, idx in enumerate(system.output_indices) if idx in (9, 10, 11)]
+        self.objective_variant = str(objective_variant)
+        if self.objective_variant not in {"baseline", "late_horizon_weight"}:
+            raise ValueError("objective_variant must be baseline or late_horizon_weight")
+        self.late_position_weight = float(late_position_weight)
+        self.async_bootstrap_mode = str(async_bootstrap_mode)
+        self.local_input_excitation_quantile = float(local_input_excitation_quantile)
+        if not 0.0 <= self.local_input_excitation_quantile <= 100.0:
+            raise ValueError("local_input_excitation_quantile must be in [0, 100]")
+        if self.async_bootstrap_mode not in {
+            "full_only",
+            "obs_ge4",
+            "pos2_obs4",
+            "bootstrap_only_partial",
+            "recent_consistent_partial_bootstrap",
+            "bounded_stale_partial_bootstrap",
+            "bounded_stale_minlen_bootstrap",
+            "xy_full_minlen_bootstrap",
+            "local_input_excitation_bootstrap",
+        }:
+            raise ValueError(
+                "async_bootstrap_mode must be full_only, obs_ge4, pos2_obs4, "
+                "bootstrap_only_partial, recent_consistent_partial_bootstrap, "
+                "bounded_stale_partial_bootstrap, bounded_stale_minlen_bootstrap, "
+                "xy_full_minlen_bootstrap, or local_input_excitation_bootstrap"
+            )
 
         self.initial_controller = initial_controller
         self.data_is_persistently_exciting = False
@@ -126,11 +156,26 @@ class DeePC:
         self.y = cp.Variable((self.p, self.N))
         self.u = cp.Variable((self.m, self.N))
         self.g = cp.Variable((self.T - self.T_ini - self.N + 1, 1))
+        self.bootstrap_target_length_min = (self.m + 1) * (self.T_ini + self.N + self.n) - 1
+        self.bootstrap_num_columns = self.bootstrap_target_length_min - self.T_ini - self.N + 1
+        self.U_p_bootstrap = cp.Parameter((self.T_ini * self.m, self.bootstrap_num_columns))
+        self.Y_p_bootstrap = cp.Parameter((self.T_ini * self.p, self.bootstrap_num_columns))
+        self.U_f_bootstrap = cp.Parameter((self.N * self.m, self.bootstrap_num_columns))
+        self.Y_f_bootstrap = cp.Parameter((self.N * self.p, self.bootstrap_num_columns))
+        self.U_p_bootstrap.value = np.zeros((self.T_ini * self.m, self.bootstrap_num_columns))
+        self.Y_p_bootstrap.value = np.zeros((self.T_ini * self.p, self.bootstrap_num_columns))
+        self.U_f_bootstrap.value = np.zeros((self.N * self.m, self.bootstrap_num_columns))
+        self.Y_f_bootstrap.value = np.zeros((self.N * self.p, self.bootstrap_num_columns))
+        self.g_r_bootstrap = cp.Parameter((self.bootstrap_num_columns, 1))
+        self.y_bootstrap = cp.Variable((self.p, self.N))
+        self.u_bootstrap = cp.Variable((self.m, self.N))
+        self.g_bootstrap = cp.Variable((self.bootstrap_num_columns, 1))
  
         # Slack variable and cost parameters
         self.is_regularized = is_regularized
         if is_regularized:
             self.sigma_y = cp.Variable((self.p, self.T_ini))
+            self.sigma_y_bootstrap = cp.Variable((self.p, self.T_ini))
             self.lambda_y = lambda_y
             self.lambda_g = lambda_g
             self.sigma_y_group_weights = cp.Parameter((self.p, 1), nonneg=True)
@@ -138,8 +183,26 @@ class DeePC:
 
         self.con = self.setup_constraints()
         self.cost = self.setup_cost()
+        self.bootstrap_con = self.setup_constraints(
+            U_p=self.U_p_bootstrap,
+            Y_p=self.Y_p_bootstrap,
+            U_f=self.U_f_bootstrap,
+            Y_f=self.Y_f_bootstrap,
+            g=self.g_bootstrap,
+            y=self.y_bootstrap,
+            u=self.u_bootstrap,
+            sigma_y=(self.sigma_y_bootstrap if self.is_regularized else None),
+        )
+        self.bootstrap_cost = self.setup_cost(
+            g=self.g_bootstrap,
+            y=self.y_bootstrap,
+            u=self.u_bootstrap,
+            g_r=self.g_r_bootstrap,
+            sigma_y=(self.sigma_y_bootstrap if self.is_regularized else None),
+        )
 
         self.problem = cp.Problem(cp.Minimize(self.cost), self.con)
+        self.bootstrap_problem = cp.Problem(cp.Minimize(self.bootstrap_cost), self.bootstrap_con)
 
         # Empty data arrays
         self.u_d = []
@@ -153,6 +216,21 @@ class DeePC:
         self.latest_measurement_metadata = None
         self.current_delay_steps = 0
         self.Hpinv = None
+        self.qp_step_records = []
+        self.bootstrap_u_d = []
+        self.bootstrap_y_d = []
+        self.bootstrap_measurement_residual_d = []
+        self.bootstrap_data_is_persistently_exciting = False
+        self.bootstrap_Hpinv = None
+        self.bootstrap_U_p_value = np.zeros((self.T_ini * self.m, self.T - self.T_ini - self.N + 1))
+        self.bootstrap_Y_p_value = np.zeros((self.T_ini * self.p, self.T - self.T_ini - self.N + 1))
+        self.bootstrap_U_f_value = np.zeros((self.N * self.m, self.T - self.T_ini - self.N + 1))
+        self.bootstrap_Y_f_value = np.zeros((self.N * self.p, self.T - self.T_ini - self.N + 1))
+        self.bootstrap_total_slot_count = 0
+        self.bootstrap_partial_slot_count = 0
+        self.bootstrap_partial_excitation_scores_accepted = []
+        self.bootstrap_partial_excitation_scores_rejected = []
+        self.bootstrap_excitation_thresholds = []
         self.bank_mode = "dual_bank"
         self.bank_states = {
             "nominal": self._capture_bank_state(),
@@ -183,8 +261,9 @@ class DeePC:
         return H
     
     def create_and_partition_hankel_matrices(self):
-        U_d = self.construct_hankel_matrix(self.u_d, self.T_ini + self.N)
-        Y_d = self.construct_hankel_matrix(self.y_d, self.T_ini + self.N)
+        partition = self._build_hankel_partition(self.u_d, self.y_d)
+        U_d = partition["U_d"]
+        Y_d = partition["Y_d"]
         if self.history_alignment == "iv_projected":
             U_d, Y_d = self._apply_iv_projection(U_d, Y_d)
 
@@ -207,6 +286,34 @@ class DeePC:
             self.sigma_y_group_weights.value = self._compute_robust_residual_stat_weights()
 
         print("Hankel matrices created and partitioned.")
+
+    def _build_hankel_partition(self, u_d, y_d, padded_num_columns=None):
+        U_d = self.construct_hankel_matrix(u_d, self.T_ini + self.N)
+        Y_d = self.construct_hankel_matrix(y_d, self.T_ini + self.N)
+        actual_num_columns = U_d.shape[1]
+        if padded_num_columns is None:
+            padded_num_columns = actual_num_columns
+        if padded_num_columns < actual_num_columns:
+            raise ValueError(
+                f"padded_num_columns must be >= actual_num_columns, got {padded_num_columns} < {actual_num_columns}"
+            )
+        if padded_num_columns > actual_num_columns:
+            pad = padded_num_columns - actual_num_columns
+            U_d_padded = np.pad(U_d, ((0, 0), (0, pad)), mode="constant")
+            Y_d_padded = np.pad(Y_d, ((0, 0), (0, pad)), mode="constant")
+        else:
+            U_d_padded = U_d
+            Y_d_padded = Y_d
+        return {
+            "U_d": U_d_padded,
+            "Y_d": Y_d_padded,
+            "U_p": U_d_padded[:self.m * self.T_ini, :],
+            "U_f": U_d_padded[self.m * self.T_ini:, :],
+            "Y_p": Y_d_padded[:self.p * self.T_ini, :],
+            "Y_f": Y_d_padded[self.p * self.T_ini:, :],
+            "Hpinv": np.linalg.pinv(np.vstack((U_d_padded, Y_d_padded))),
+            "actual_num_columns": int(actual_num_columns),
+        }
 
     def _apply_iv_projection(self, U_d, Y_d):
         lag = self.iv_projection_lag
@@ -253,65 +360,88 @@ class DeePC:
         suffix = array[:, :-lag] if array.shape[1] > lag else np.empty((array.shape[0], 0))
         return np.hstack((prefix, suffix))
 
-    def setup_constraints(self):
+    def setup_constraints(self, U_p=None, Y_p=None, U_f=None, Y_f=None, g=None, y=None, u=None, sigma_y=None):
+        U_p = self.U_p if U_p is None else U_p
+        Y_p = self.Y_p if Y_p is None else Y_p
+        U_f = self.U_f if U_f is None else U_f
+        Y_f = self.Y_f if Y_f is None else Y_f
+        g = self.g if g is None else g
+        y_matrix = self.y if y is None else y
+        u_matrix = self.u if u is None else u
+        sigma_y_matrix = None
         # Equality constraint
         u_ini = np.reshape(self.u_ini, (self.m*self.T_ini, 1), order='F')
         y_ini = np.reshape(self.y_ini, (self.p*self.T_ini, 1), order='F')
-        u = np.reshape(self.u, (self.m*self.N, 1), order='F')
-        y = np.reshape(self.y, (self.p*self.N, 1), order='F')
+        u = np.reshape(u_matrix, (self.m*self.N, 1), order='F')
+        y = np.reshape(y_matrix, (self.p*self.N, 1), order='F')
 
         if self.is_regularized:
-            sigma_y = np.reshape(self.sigma_y, (self.p*self.T_ini, 1), order='F')
+            sigma_y_matrix = self.sigma_y if sigma_y is None else sigma_y
+            sigma_y = np.reshape(sigma_y_matrix, (self.p*self.T_ini, 1), order='F')
         
-        eq_con = [self.U_p @ self.g == u_ini]
+        eq_con = [U_p @ g == u_ini]
         if self.history_alignment == "async_masked":
-            Y_pg = cp.reshape(self.Y_p @ self.g, (self.p, self.T_ini), order="F")
+            Y_pg = cp.reshape(Y_p @ g, (self.p, self.T_ini), order="F")
             if self.is_regularized:
-                eq_con += [cp.multiply(self.y_ini_mask, Y_pg - self.y_ini - self.sigma_y) == 0]
-                eq_con += [cp.multiply(1.0 - self.y_ini_mask, self.sigma_y) == 0]
+                eq_con += [cp.multiply(self.y_ini_mask, Y_pg - self.y_ini - sigma_y_matrix) == 0]
+                eq_con += [cp.multiply(1.0 - self.y_ini_mask, sigma_y_matrix) == 0]
             else:
                 eq_con += [cp.multiply(self.y_ini_mask, Y_pg - self.y_ini) == 0]
         elif self.regularization_mode == "drop_yaw_past" and self.yaw_output_rows:
-            Y_pg = cp.reshape(self.Y_p @ self.g, (self.p, self.T_ini), order="F")
+            Y_pg = cp.reshape(Y_p @ g, (self.p, self.T_ini), order="F")
             for row in self.non_yaw_output_rows:
                 eq_con += [Y_pg[row, :] == self.y_ini[row, :]]
         elif self.is_regularized and self.regularization_mode == "yaw_selective_slack" and self.yaw_output_rows:
-            Y_pg = cp.reshape(self.Y_p @ self.g, (self.p, self.T_ini), order="F")
+            Y_pg = cp.reshape(Y_p @ g, (self.p, self.T_ini), order="F")
             for row in self.non_yaw_output_rows:
                 eq_con += [Y_pg[row, :] == self.y_ini[row, :]]
             for row in self.yaw_output_rows:
-                eq_con += [Y_pg[row, :] == self.y_ini[row, :] + self.sigma_y[row, :]]
+                eq_con += [Y_pg[row, :] == self.y_ini[row, :] + sigma_y_matrix[row, :]]
             for row in self.non_yaw_output_rows:
-                eq_con += [self.sigma_y[row, :] == 0]
+                eq_con += [sigma_y_matrix[row, :] == 0]
         else:
-            eq_con += [self.Y_p @ self.g == y_ini + (sigma_y if self.is_regularized else 0)]
-        eq_con += [self.U_f @ self.g == u]
-        eq_con += [self.Y_f @ self.g == y]
+            eq_con += [Y_p @ g == y_ini + (sigma_y if self.is_regularized else 0)]
+        eq_con += [U_f @ g == u]
+        eq_con += [Y_f @ g == y]
             
         # Predicted Ouput and Input Constraint
         ineq_con = []
         
         for k in range(self.N):
-            ineq_con += [self.system.output_constraint(self.y[:,k])]
-            ineq_con += [self.system.input_constraint(self.u[:,k])]
+            ineq_con += [self.system.output_constraint(y_matrix[:,k])]
+            ineq_con += [self.system.input_constraint(u_matrix[:,k])]
 
         con = eq_con + ineq_con
 
         return con
 
-    def setup_cost(self):
+    def setup_cost(self, g=None, y=None, u=None, g_r=None, sigma_y=None):
+        g = self.g if g is None else g
+        y = self.y if y is None else y
+        u = self.u if u is None else u
+        g_r = self.g_r if g_r is None else g_r
+        sigma_y = self.sigma_y if sigma_y is None and self.is_regularized else sigma_y
         cost = 0
         for k in range(self.N):
-            cost += cp.quad_form(self.y[:,k]-self.ref[:,k], self.system.Q) + cp.quad_form(self.u[:,k]-self.system.u_eq, self.system.R)
+            cost += cp.quad_form(y[:,k]-self.ref[:,k], self.system.Q) + cp.quad_form(u[:,k]-self.system.u_eq, self.system.R)
+            if (
+                self.objective_variant == "late_horizon_weight"
+                and self.position_output_rows
+                and k >= self.N // 2
+                and self.late_position_weight > 1.0
+            ):
+                extra_weight = self.late_position_weight - 1.0
+                late_position_error = y[self.position_output_rows, k] - self.ref[self.position_output_rows, k]
+                cost += extra_weight * cp.sum_squares(late_position_error)
     
         if self.is_regularized:
-            cost += self.lambda_g*cp.norm2(self.g-self.g_r)
+            cost += self.lambda_g*cp.norm2(g-g_r)
             if self.regularization_mode == "block_l2":
-                cost += self._block_sigma_y_cost()
+                cost += self._block_sigma_y_cost(sigma_y)
             elif self.regularization_mode == "yaw_selective_slack":
-                cost += self._yaw_selective_sigma_y_cost()
+                cost += self._yaw_selective_sigma_y_cost(sigma_y)
             else:
-                weighted_sigma_y = cp.multiply(self.sigma_y_group_weights, self.sigma_y)
+                weighted_sigma_y = cp.multiply(self.sigma_y_group_weights, sigma_y)
                 cost += self.lambda_y*cp.norm2(weighted_sigma_y)
 
         if self.history_alignment == "consistency_gated_time_aligned":
@@ -321,21 +451,21 @@ class DeePC:
 
         return cost
 
-    def _block_sigma_y_cost(self):
+    def _block_sigma_y_cost(self, sigma_y):
         cost = 0
         block_rows = self._sigma_y_blocks()
         if block_rows["roll_pitch"]:
-            cost += self.block_lambda_roll_pitch * cp.norm2(self.sigma_y[block_rows["roll_pitch"], :])
+            cost += self.block_lambda_roll_pitch * cp.norm2(sigma_y[block_rows["roll_pitch"], :])
         if block_rows["yaw"]:
-            cost += self.block_lambda_yaw * cp.norm2(self.sigma_y[block_rows["yaw"], :])
+            cost += self.block_lambda_yaw * cp.norm2(sigma_y[block_rows["yaw"], :])
         if block_rows["position"]:
-            cost += self.block_lambda_position * cp.norm2(self.sigma_y[block_rows["position"], :])
+            cost += self.block_lambda_position * cp.norm2(sigma_y[block_rows["position"], :])
         return cost
 
-    def _yaw_selective_sigma_y_cost(self):
+    def _yaw_selective_sigma_y_cost(self, sigma_y):
         if not self.yaw_output_rows:
             return 0
-        return self.lambda_y * cp.norm2(self.sigma_y[self.yaw_output_rows, :])
+        return self.lambda_y * cp.norm2(sigma_y[self.yaw_output_rows, :])
 
     def _sigma_y_blocks(self):
         blocks = {
@@ -444,10 +574,20 @@ class DeePC:
         self.requested_bank_name = desired_health_mode
         self.control_bank_name = control_bank
         self._restore_bank_state(control_bank)
-        u_optimal, _ = self._compute_control_candidate_for_active_bank(
+        u_optimal, _, qp_online, qp_source, pe_online = self._compute_control_candidate_for_active_bank(
             x_current,
             measurement_packet,
             measurement_residual,
+        )
+        self.qp_step_records.append(
+            {
+                "step": int(measurement_packet["delivered_step"]),
+                "qp_online": bool(qp_online),
+                "pe_online": bool(pe_online),
+                "qp_source": str(qp_source),
+                "control_bank_name": str(control_bank),
+                "training_bank_name": str(desired_health_mode),
+            }
         )
 
         self._restore_bank_state(desired_health_mode)
@@ -472,10 +612,25 @@ class DeePC:
 
         return u_optimal
 
+    def compute_bootstrap_optimal_control(self, control_offset=0):
+        solve_kwargs = {
+            "verbose": False,
+            "ignore_dpp": True,
+        }
+        if self.solver is not None:
+            solve_kwargs["solver"] = self.solver
+
+        self.bootstrap_problem.solve(**solve_kwargs)
+        control_index = min(max(int(control_offset), 0), self.N - 1)
+        u_optimal = self.u_bootstrap[:, control_index].value
+
+        return u_optimal
+
     def _prepare_active_bank_for_measurement(self, measurement_packet, measurement_residual):
+        qp_path_available = self._qp_path_available()
         if (
             self.history_alignment in {"time_aligned", "suffix_aligned", "consistency_gated_time_aligned"}
-            and self.data_is_persistently_exciting
+            and qp_path_available
             and measurement_packet["source_step"] < measurement_packet["delivered_step"]
             and measurement_packet["source_step"] in self.applied_inputs_by_step
         ):
@@ -489,7 +644,7 @@ class DeePC:
             self._refresh_ini_windows()
         elif (
             self.history_alignment == "async_masked"
-            and self.data_is_persistently_exciting
+            and qp_path_available
             and self._effective_reference_step(measurement_packet) < measurement_packet["delivered_step"]
         ):
             self._update_async_source_slots(measurement_packet, measurement_residual)
@@ -515,13 +670,33 @@ class DeePC:
 
     def _compute_control_candidate_for_active_bank(self, x_current, measurement_packet, measurement_residual):
         control_offset = self._prepare_active_bank_for_measurement(measurement_packet, measurement_residual)
+        qp_source = "initial_controller"
+        pe_online = False
         if self.data_is_persistently_exciting:
+            pe_online = True
+            qp_source = "formal_bank"
             u_optimal = self.compute_optimal_control(control_offset=control_offset)
             score = float(self.problem.value) if self.problem.value is not None else float("inf")
+            return u_optimal, score, True, qp_source, pe_online
+
+        if self._bootstrap_qp_available():
+            pe_online = True
+            qp_source = "bootstrap_bank"
+            if self._uses_separate_bootstrap_problem():
+                self._update_bootstrap_steady_state_solution()
+                u_optimal = self.compute_bootstrap_optimal_control(control_offset=control_offset)
+                score = float(self.bootstrap_problem.value) if self.bootstrap_problem.value is not None else float("inf")
+            else:
+                with self._temporary_bootstrap_hankel_bank():
+                    self._update_steady_state_solution()
+                    u_optimal = self.compute_optimal_control(control_offset=control_offset)
+                    score = float(self.problem.value) if self.problem.value is not None else float("inf")
+            return u_optimal, score, True, qp_source, pe_online
+
         else:
             u_optimal = self.initial_controller.compute_input(x_current, self.ref.value[:, 0])
             score = float("inf")
-        return u_optimal, score
+        return u_optimal, score, False, qp_source, pe_online
 
     def collect_and_update(self, measurement_packet, u_optimal, measurement_residual):
         delivered_step = int(measurement_packet["delivered_step"])
@@ -561,15 +736,8 @@ class DeePC:
         # Update the reference trajectory.
         self.shift_reference()
         
-        if self.data_is_persistently_exciting:
-            # Update steady state solution g_r 
-            uy_r = np.hstack((np.tile(self.system.u_eq, self.T_ini),
-                            np.tile(self.ref.value[:,0], self.T_ini),
-                            np.tile(self.system.u_eq, self.N),
-                            np.tile(self.ref.value[:,0], self.N),
-                            )).reshape(-1, 1)
-            
-            self.g_r.value = self.Hpinv @ uy_r
+        if self._qp_path_available():
+            self._update_steady_state_solution()
 
     def shift_reference(self):
         self.current_reference_step += 1
@@ -748,6 +916,51 @@ class DeePC:
             self.create_and_partition_hankel_matrices()
             self.data_is_persistently_exciting = self.is_persistently_excited_of_order_L(self.u_d, self.T_ini + self.N + self.n)
 
+    def _append_bootstrap_training_pair(self, pair, is_partial):
+        if self.bootstrap_data_is_persistently_exciting:
+            return
+
+        self.bootstrap_u_d.append(np.asarray(pair["u"], dtype=float).reshape(self.m))
+        self.bootstrap_y_d.append(np.asarray(pair["y"], dtype=float).reshape(self.p))
+        self.bootstrap_measurement_residual_d.append(
+            np.asarray(pair["measurement_residual"], dtype=float).reshape(self.p)
+        )
+        self.bootstrap_total_slot_count += 1
+        if is_partial:
+            self.bootstrap_partial_slot_count += 1
+
+        target_length = self._bootstrap_target_length()
+        if len(self.bootstrap_u_d) == target_length:
+            bootstrap_u = np.array(self.bootstrap_u_d, dtype=float).T
+            bootstrap_y = np.array(self.bootstrap_y_d, dtype=float).T
+            partition = self._build_hankel_partition(
+                bootstrap_u,
+                bootstrap_y,
+                padded_num_columns=(
+                    None if self._uses_separate_bootstrap_problem() else self.T - self.T_ini - self.N + 1
+                ),
+            )
+            self.bootstrap_U_p_value = partition["U_p"]
+            self.bootstrap_U_f_value = partition["U_f"]
+            self.bootstrap_Y_p_value = partition["Y_p"]
+            self.bootstrap_Y_f_value = partition["Y_f"]
+            self.bootstrap_Hpinv = partition["Hpinv"]
+            if self._uses_separate_bootstrap_problem():
+                self.U_p_bootstrap.value = np.asarray(partition["U_p"], dtype=float).copy()
+                self.Y_p_bootstrap.value = np.asarray(partition["Y_p"], dtype=float).copy()
+                self.U_f_bootstrap.value = np.asarray(partition["U_f"], dtype=float).copy()
+                self.Y_f_bootstrap.value = np.asarray(partition["Y_f"], dtype=float).copy()
+            self.bootstrap_u_d = bootstrap_u
+            self.bootstrap_y_d = bootstrap_y
+            self.bootstrap_measurement_residual_d = np.array(
+                self.bootstrap_measurement_residual_d,
+                dtype=float,
+            ).T
+            self.bootstrap_data_is_persistently_exciting = self.is_persistently_excited_of_order_L(
+                self.bootstrap_u_d,
+                self.T_ini + self.N + self.n,
+            )
+
     def _should_refresh_mature_bank(self):
         if self.health_mode != "degraded":
             return False
@@ -878,6 +1091,20 @@ class DeePC:
             "Y_p": np.asarray(self.Y_p.value, dtype=float).copy(),
             "U_f": np.asarray(self.U_f.value, dtype=float).copy(),
             "Y_f": np.asarray(self.Y_f.value, dtype=float).copy(),
+            "bootstrap_u_d": self._copy_bank_array_or_list(self.bootstrap_u_d),
+            "bootstrap_y_d": self._copy_bank_array_or_list(self.bootstrap_y_d),
+            "bootstrap_measurement_residual_d": self._copy_bank_array_or_list(self.bootstrap_measurement_residual_d),
+            "bootstrap_data_is_persistently_exciting": bool(self.bootstrap_data_is_persistently_exciting),
+            "bootstrap_Hpinv": None if self.bootstrap_Hpinv is None else np.asarray(self.bootstrap_Hpinv, dtype=float).copy(),
+            "bootstrap_U_p_value": np.asarray(self.bootstrap_U_p_value, dtype=float).copy(),
+            "bootstrap_Y_p_value": np.asarray(self.bootstrap_Y_p_value, dtype=float).copy(),
+            "bootstrap_U_f_value": np.asarray(self.bootstrap_U_f_value, dtype=float).copy(),
+            "bootstrap_Y_f_value": np.asarray(self.bootstrap_Y_f_value, dtype=float).copy(),
+            "bootstrap_total_slot_count": int(self.bootstrap_total_slot_count),
+            "bootstrap_partial_slot_count": int(self.bootstrap_partial_slot_count),
+            "bootstrap_partial_excitation_scores_accepted": list(self.bootstrap_partial_excitation_scores_accepted),
+            "bootstrap_partial_excitation_scores_rejected": list(self.bootstrap_partial_excitation_scores_rejected),
+            "bootstrap_excitation_thresholds": list(self.bootstrap_excitation_thresholds),
         }
 
     def _as_history_list(self, value):
@@ -917,6 +1144,22 @@ class DeePC:
         self.Y_p.value = np.asarray(bank["Y_p"], dtype=float).copy()
         self.U_f.value = np.asarray(bank["U_f"], dtype=float).copy()
         self.Y_f.value = np.asarray(bank["Y_f"], dtype=float).copy()
+        self.bootstrap_u_d = self._copy_bank_array_or_list(bank.get("bootstrap_u_d", []))
+        self.bootstrap_y_d = self._copy_bank_array_or_list(bank.get("bootstrap_y_d", []))
+        self.bootstrap_measurement_residual_d = self._copy_bank_array_or_list(
+            bank.get("bootstrap_measurement_residual_d", [])
+        )
+        self.bootstrap_data_is_persistently_exciting = bool(bank.get("bootstrap_data_is_persistently_exciting", False))
+        self.bootstrap_Hpinv = None if bank.get("bootstrap_Hpinv") is None else np.asarray(bank["bootstrap_Hpinv"], dtype=float).copy()
+        self.bootstrap_U_p_value = np.asarray(bank.get("bootstrap_U_p_value", self.bootstrap_U_p_value), dtype=float).copy()
+        self.bootstrap_Y_p_value = np.asarray(bank.get("bootstrap_Y_p_value", self.bootstrap_Y_p_value), dtype=float).copy()
+        self.bootstrap_U_f_value = np.asarray(bank.get("bootstrap_U_f_value", self.bootstrap_U_f_value), dtype=float).copy()
+        self.bootstrap_Y_f_value = np.asarray(bank.get("bootstrap_Y_f_value", self.bootstrap_Y_f_value), dtype=float).copy()
+        self.bootstrap_total_slot_count = int(bank.get("bootstrap_total_slot_count", 0))
+        self.bootstrap_partial_slot_count = int(bank.get("bootstrap_partial_slot_count", 0))
+        self.bootstrap_partial_excitation_scores_accepted = list(bank.get("bootstrap_partial_excitation_scores_accepted", []))
+        self.bootstrap_partial_excitation_scores_rejected = list(bank.get("bootstrap_partial_excitation_scores_rejected", []))
+        self.bootstrap_excitation_thresholds = list(bank.get("bootstrap_excitation_thresholds", []))
 
     def _capture_active_bank_state(self):
         self._capture_bank_state_to(self._active_bank_name())
@@ -1044,16 +1287,249 @@ class DeePC:
             slot = self.async_source_slots[source_step]
             if slot["u"] is None:
                 break
-            # For async/dropout data, only train the Hankel bank on fully
-            # observed source slots. Partially observed slots still help the
-            # online masked history constraints, but pushing hold-last-filled
-            # rows into the training bank contaminates the naive baseline under
-            # burst dropout, especially on curved references.
-            if np.any(np.asarray(slot["mask"], dtype=float).reshape(self.p) < 0.5):
-                self.next_async_training_source_step += 1
-                continue
-            self._append_training_pair(slot)
+            slot_is_partial = np.any(np.asarray(slot["mask"], dtype=float).reshape(self.p) < 0.5)
+            if self.async_bootstrap_mode in {
+                "bootstrap_only_partial",
+                "recent_consistent_partial_bootstrap",
+                "bounded_stale_partial_bootstrap",
+                "bounded_stale_minlen_bootstrap",
+                "xy_full_minlen_bootstrap",
+                "local_input_excitation_bootstrap",
+            }:
+                if not slot_is_partial:
+                    self._append_training_pair(slot)
+                    self._append_bootstrap_training_pair(slot, is_partial=False)
+                else:
+                    accept_partial, score = self._bootstrap_partial_acceptance(slot)
+                    if score is not None:
+                        if accept_partial:
+                            self.bootstrap_partial_excitation_scores_accepted.append(float(score))
+                        else:
+                            self.bootstrap_partial_excitation_scores_rejected.append(float(score))
+                    if accept_partial:
+                        self._append_bootstrap_training_pair(slot, is_partial=True)
+            else:
+                if not self._async_slot_is_bootstrap_eligible(slot):
+                    self.next_async_training_source_step += 1
+                    continue
+                self._append_training_pair(slot)
             self.next_async_training_source_step += 1
+
+    def _async_slot_is_bootstrap_eligible(self, slot):
+        mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+        observed = mask > 0.5
+        if self.async_bootstrap_mode == "full_only":
+            return bool(np.all(observed))
+        if self.async_bootstrap_mode == "obs_ge4":
+            return int(np.sum(observed)) >= 4
+        if self.async_bootstrap_mode == "pos2_obs4":
+            return self._async_slot_matches_partial_bootstrap_rule(slot)
+        if self.async_bootstrap_mode in {
+            "bootstrap_only_partial",
+            "recent_consistent_partial_bootstrap",
+            "bounded_stale_partial_bootstrap",
+            "bounded_stale_minlen_bootstrap",
+            "xy_full_minlen_bootstrap",
+            "local_input_excitation_bootstrap",
+        }:
+            return bool(np.all(observed))
+        raise ValueError(f"Unsupported async bootstrap mode: {self.async_bootstrap_mode}")
+
+    def _async_slot_matches_partial_bootstrap_rule(self, slot):
+        mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+        observed = mask > 0.5
+        position_observed = int(np.sum(observed[self.position_output_rows])) if self.position_output_rows else 0
+        return int(np.sum(observed)) >= 4 and position_observed >= 2
+
+    def _async_slot_matches_recent_consistent_partial_rule(self, slot):
+        mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+        observed = mask > 0.5
+        if np.all(observed):
+            return True
+        position_observed = int(np.sum(observed[self.position_output_rows])) if self.position_output_rows else 0
+        if int(np.sum(observed)) < 5 or position_observed < 2:
+            return False
+        source_steps = np.asarray(slot["source_steps"], dtype=float).reshape(self.p)
+        slot_step = int(slot["source_step"])
+        missing = ~observed
+        stale_missing = slot_step - source_steps[missing]
+        if stale_missing.size == 0:
+            return True
+        return bool(np.all(stale_missing <= 1.0))
+
+    def _async_slot_matches_bounded_stale_partial_rule(self, slot):
+        mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+        observed = mask > 0.5
+        if np.all(observed):
+            return True
+        position_observed = int(np.sum(observed[self.position_output_rows])) if self.position_output_rows else 0
+        if int(np.sum(observed)) < 5 or position_observed < 2:
+            return False
+        source_steps = np.asarray(slot["source_steps"], dtype=float).reshape(self.p)
+        slot_step = int(slot["source_step"])
+        missing = ~observed
+        stale_missing = slot_step - source_steps[missing]
+        if stale_missing.size == 0:
+            return True
+        return bool(np.all(stale_missing <= 2.0))
+
+    def _async_slot_matches_xy_full_partial_rule(self, slot):
+        mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+        observed = mask > 0.5
+        if np.all(observed):
+            return True
+        if self.p < 5:
+            return False
+        if not (observed[3] and observed[4]):
+            return False
+        if int(np.sum(observed)) < 4:
+            return False
+        source_steps = np.asarray(slot["source_steps"], dtype=float).reshape(self.p)
+        slot_step = int(slot["source_step"])
+        missing = ~observed
+        stale_missing = slot_step - source_steps[missing]
+        if stale_missing.size == 0:
+            return True
+        return bool(np.all(stale_missing <= 2.0))
+
+    def _async_slot_matches_bootstrap_partial_rule(self, slot):
+        if self.async_bootstrap_mode == "bootstrap_only_partial":
+            return self._async_slot_matches_partial_bootstrap_rule(slot)
+        if self.async_bootstrap_mode == "recent_consistent_partial_bootstrap":
+            return self._async_slot_matches_recent_consistent_partial_rule(slot)
+        if self.async_bootstrap_mode in {"bounded_stale_partial_bootstrap", "bounded_stale_minlen_bootstrap"}:
+            return self._async_slot_matches_bounded_stale_partial_rule(slot)
+        if self.async_bootstrap_mode == "xy_full_minlen_bootstrap":
+            return self._async_slot_matches_xy_full_partial_rule(slot)
+        if self.async_bootstrap_mode == "local_input_excitation_bootstrap":
+            return True
+        raise ValueError(f"Unsupported bootstrap partial rule for mode: {self.async_bootstrap_mode}")
+
+    def _bootstrap_partial_acceptance(self, slot):
+        if self.async_bootstrap_mode == "local_input_excitation_bootstrap":
+            score = self._local_input_excitation_score(int(slot["source_step"]))
+            threshold = self._local_input_excitation_threshold()
+            if threshold is not None:
+                self.bootstrap_excitation_thresholds.append(float(threshold))
+            return (
+                score is not None and threshold is not None and score >= threshold,
+                score,
+            )
+        return self._async_slot_matches_bootstrap_partial_rule(slot), None
+
+    def _local_input_excitation_score(self, source_step, window=5):
+        start_step = max(int(source_step) - int(window) + 1, 0)
+        inputs = []
+        for step in range(start_step, int(source_step) + 1):
+            if step not in self.applied_inputs_by_step:
+                return None
+            inputs.append(np.asarray(self.applied_inputs_by_step[step], dtype=float).reshape(self.m))
+        if len(inputs) < 2:
+            return None
+        input_array = np.asarray(inputs, dtype=float)
+        deltas = np.diff(input_array, axis=0)
+        return float(np.sqrt(np.mean(np.sum(np.square(deltas), axis=1))))
+
+    def _local_input_excitation_threshold(self):
+        scores = []
+        for source_step, slot in sorted(self.async_source_slots.items()):
+            if source_step >= self.next_async_training_source_step:
+                break
+            mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+            if np.any(mask < 0.5):
+                continue
+            score = self._local_input_excitation_score(int(source_step))
+            if score is not None:
+                scores.append(score)
+        if not scores:
+            return None
+        return float(np.percentile(np.asarray(scores, dtype=float), self.local_input_excitation_quantile))
+
+    def _qp_path_available(self):
+        return bool(self.data_is_persistently_exciting or self._bootstrap_qp_available())
+
+    def _bootstrap_qp_available(self):
+        return self.async_bootstrap_mode in {
+            "bootstrap_only_partial",
+            "recent_consistent_partial_bootstrap",
+            "bounded_stale_partial_bootstrap",
+            "bounded_stale_minlen_bootstrap",
+            "xy_full_minlen_bootstrap",
+            "local_input_excitation_bootstrap",
+        } and bool(self.bootstrap_data_is_persistently_exciting)
+
+    def _bootstrap_target_length(self):
+        if self.async_bootstrap_mode in {
+            "recent_consistent_partial_bootstrap",
+            "bounded_stale_minlen_bootstrap",
+            "xy_full_minlen_bootstrap",
+            "local_input_excitation_bootstrap",
+        }:
+            return (self.m + 1) * (self.T_ini + self.N + self.n) - 1
+        return self.T
+
+    def _uses_separate_bootstrap_problem(self):
+        return self.async_bootstrap_mode in {
+            "bounded_stale_minlen_bootstrap",
+            "xy_full_minlen_bootstrap",
+            "local_input_excitation_bootstrap",
+        }
+
+    def _update_steady_state_solution(self):
+        if self.Hpinv is None:
+            return
+        uy_r = np.hstack((
+            np.tile(self.system.u_eq, self.T_ini),
+            np.tile(self.ref.value[:, 0], self.T_ini),
+            np.tile(self.system.u_eq, self.N),
+            np.tile(self.ref.value[:, 0], self.N),
+        )).reshape(-1, 1)
+        self.g_r.value = self.Hpinv @ uy_r
+
+    def _update_bootstrap_steady_state_solution(self):
+        if self.bootstrap_Hpinv is None:
+            return
+        uy_r = np.hstack((
+            np.tile(self.system.u_eq, self.T_ini),
+            np.tile(self.ref.value[:, 0], self.T_ini),
+            np.tile(self.system.u_eq, self.N),
+            np.tile(self.ref.value[:, 0], self.N),
+        )).reshape(-1, 1)
+        self.g_r_bootstrap.value = self.bootstrap_Hpinv @ uy_r
+
+    class _TemporaryBootstrapHankelBank:
+        def __init__(self, controller):
+            self.controller = controller
+            self.saved = None
+
+        def __enter__(self):
+            c = self.controller
+            self.saved = (
+                np.asarray(c.U_p.value, dtype=float).copy(),
+                np.asarray(c.Y_p.value, dtype=float).copy(),
+                np.asarray(c.U_f.value, dtype=float).copy(),
+                np.asarray(c.Y_f.value, dtype=float).copy(),
+                None if c.Hpinv is None else np.asarray(c.Hpinv, dtype=float).copy(),
+            )
+            c.U_p.value = np.asarray(c.bootstrap_U_p_value, dtype=float).copy()
+            c.Y_p.value = np.asarray(c.bootstrap_Y_p_value, dtype=float).copy()
+            c.U_f.value = np.asarray(c.bootstrap_U_f_value, dtype=float).copy()
+            c.Y_f.value = np.asarray(c.bootstrap_Y_f_value, dtype=float).copy()
+            c.Hpinv = None if c.bootstrap_Hpinv is None else np.asarray(c.bootstrap_Hpinv, dtype=float).copy()
+            return c
+
+        def __exit__(self, exc_type, exc, tb):
+            c = self.controller
+            U_p, Y_p, U_f, Y_f, Hpinv = self.saved
+            c.U_p.value = U_p
+            c.Y_p.value = Y_p
+            c.U_f.value = U_f
+            c.Y_f.value = Y_f
+            c.Hpinv = Hpinv
+            return False
+
+    def _temporary_bootstrap_hankel_bank(self):
+        return DeePC._TemporaryBootstrapHankelBank(self)
         
     def is_persistently_excited_of_order_L(self, x, L):
         H = self.construct_hankel_matrix(x, L)
