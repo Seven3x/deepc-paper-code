@@ -1551,9 +1551,18 @@ class DeePC:
         thresholds = self._bootstrap_full_slot_dynamic_thresholds()
         if thresholds is None:
             return False, None
-        rms_threshold = min(thresholds["delta_u_rms_median"] * 0.9, 0.23)
-        cond_threshold = min(thresholds["local_input_cond_median"] * 0.9, 10.0)
-        accept = bool(delta_u_rms <= rms_threshold and local_input_cond <= cond_threshold)
+        if remaining_slots == 2:
+            rms_threshold = min(thresholds["delta_u_rms_median"] * 0.8, 0.20)
+            cond_threshold = min(thresholds["local_input_cond_median"] * 3.0, 60.0)
+            accept = bool(delta_u_rms <= rms_threshold and local_input_cond <= cond_threshold)
+        else:
+            mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+            observed = mask > 0.5
+            xy_rows = self.position_output_rows[:2]
+            xy_observed = bool(np.all(observed[xy_rows])) if xy_rows else False
+            rms_threshold = min(thresholds["delta_u_rms_median"] * 1.0, 0.25)
+            cond_threshold = min(thresholds["local_input_cond_median"] * 2.0, 40.0)
+            accept = bool((not xy_observed) and delta_u_rms <= rms_threshold and local_input_cond <= cond_threshold)
         return accept, None
 
     def _bootstrap_remaining_slots_to_target(self):
