@@ -395,6 +395,97 @@ def compute_metrics(result, trajectory, system, eval_start_step=0, eval_num_step
     return metrics
 
 
+def compute_position_error_trace(result, trajectory):
+    y_eval_full = result.get("y_true", result["y"])
+    total_steps = y_eval_full.shape[1]
+    ref_full = trajectory.extend_reference(trajectory.output_reference, total_steps)[:, :total_steps]
+    pos_err = y_eval_full[3:6, :] - ref_full[3:6, :]
+    return np.linalg.norm(pos_err, axis=0)
+
+
+def build_bootstrap_slot_audit_summary(controller, result, trajectory, eval_start_step=0, eval_num_steps=None):
+    raw_slots = list(getattr(controller, "bootstrap_slot_audit", []))
+    if not raw_slots:
+        return None
+
+    pos_error_norm = compute_position_error_trace(result, trajectory)
+    total_steps = pos_error_norm.shape[0]
+    start = max(int(eval_start_step), 0)
+    stop = total_steps if eval_num_steps is None else min(total_steps, start + int(eval_num_steps))
+    qp_records = list(getattr(controller, "qp_step_records", []))
+    qp_steps = sorted(int(record["step"]) for record in qp_records if record.get("qp_online"))
+    first_qp_step = qp_steps[0] if qp_steps else None
+
+    partial_slots = sorted(raw_slots, key=lambda item: int(item["source_step"]))
+    partial_source_steps = [int(item["source_step"]) for item in partial_slots]
+    partial_set = set(partial_source_steps)
+    segment_by_step = {}
+    segments = []
+    for step in partial_source_steps:
+        if (step - 1) not in partial_set:
+            seg = [step]
+            cursor = step + 1
+            while cursor in partial_set:
+                seg.append(cursor)
+                cursor += 1
+            segments.append(seg)
+            for idx, seg_step in enumerate(seg):
+                segment_by_step[seg_step] = {
+                    "segment_length": int(len(seg)),
+                    "segment_pos_from_start": int(idx),
+                    "segment_pos_from_end": int(len(seg) - idx - 1),
+                    "is_isolated_partial": bool(len(seg) == 1),
+                    "is_recovery_early_partial": bool(idx <= 1),
+                }
+
+    enriched = []
+    for slot in partial_slots:
+        delivered_step = int(slot["delivered_step"])
+        source_step = int(slot["source_step"])
+        prev_idx = min(max(delivered_step - 1, 0), total_steps - 1)
+        curr_idx = min(max(delivered_step, 0), total_steps - 1)
+        next_idx = min(curr_idx + 3, total_steps)
+        prev_error = float(pos_error_norm[prev_idx])
+        curr_error = float(pos_error_norm[curr_idx])
+        future_mean = float(np.mean(pos_error_norm[curr_idx:next_idx])) if next_idx > curr_idx else curr_error
+        future_max = float(np.max(pos_error_norm[curr_idx:next_idx])) if next_idx > curr_idx else curr_error
+        error_delta_next3 = float(future_mean - prev_error)
+        distance_to_first_qp = None if first_qp_step is None else int(delivered_step - first_qp_step)
+        qp_online_within_3 = any(curr_idx <= step <= curr_idx + 3 for step in qp_steps)
+        if slot["accepted_into_bootstrap_bank"]:
+            if qp_online_within_3 and error_delta_next3 <= 0.0:
+                label = "helpful_partial"
+            elif qp_online_within_3 and error_delta_next3 > 0.05:
+                label = "harmful_partial"
+            elif first_qp_step is not None and delivered_step >= first_qp_step and error_delta_next3 > 0.05:
+                label = "harmful_partial"
+            else:
+                label = "neutral_or_uncertain"
+        else:
+            label = "rejected_partial"
+        enriched.append(
+            {
+                **slot,
+                **segment_by_step.get(source_step, {}),
+                "delivered_in_eval_window": bool(start <= delivered_step < stop),
+                "distance_to_first_qp_step": distance_to_first_qp,
+                "position_error_prev": prev_error,
+                "position_error_at_delivered_step": curr_error,
+                "position_error_next3_mean": future_mean,
+                "position_error_next3_max": future_max,
+                "position_error_delta_next3_mean_minus_prev": error_delta_next3,
+                "qp_online_within_3_steps": bool(qp_online_within_3),
+                "slot_role_label": label,
+            }
+        )
+
+    return {
+        "audit_object_slot_count": int(len(enriched)),
+        "first_qp_step": first_qp_step,
+        "slots": enriched,
+    }
+
+
 def run_single_experiment(args):
     ensure_output_dirs()
     measurement_config = build_measurement_config(args)
@@ -472,6 +563,13 @@ def run_single_experiment(args):
     }
 
     if args.controller == "deepc":
+        bootstrap_slot_audit = build_bootstrap_slot_audit_summary(
+            controller,
+            result,
+            trajectory,
+            eval_start_step=task_start_steps,
+            eval_num_steps=eval_num_steps,
+        )
         output["deepc"] = {
             "T_ini": args.deepc_T_ini,
             "N": args.deepc_N,
@@ -544,6 +642,7 @@ def run_single_experiment(args):
             "bootstrap_excitation_thresholds": list(
                 getattr(controller, "bootstrap_excitation_thresholds", [])
             ),
+            "bootstrap_slot_audit": bootstrap_slot_audit,
         }
     if args.controller == "mpc":
         output["mpc"] = {
@@ -657,6 +756,7 @@ def build_parser():
             "obs_ge4",
             "pos2_obs4",
             "bootstrap_only_partial",
+            "bootstrap_only_partial_qp_guard",
             "recent_consistent_partial_bootstrap",
             "bounded_stale_partial_bootstrap",
             "bounded_stale_minlen_bootstrap",

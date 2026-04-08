@@ -82,6 +82,7 @@ class DeePC:
             "obs_ge4",
             "pos2_obs4",
             "bootstrap_only_partial",
+            "bootstrap_only_partial_qp_guard",
             "recent_consistent_partial_bootstrap",
             "bounded_stale_partial_bootstrap",
             "bounded_stale_minlen_bootstrap",
@@ -90,7 +91,7 @@ class DeePC:
         }:
             raise ValueError(
                 "async_bootstrap_mode must be full_only, obs_ge4, pos2_obs4, "
-                "bootstrap_only_partial, recent_consistent_partial_bootstrap, "
+                "bootstrap_only_partial, bootstrap_only_partial_qp_guard, recent_consistent_partial_bootstrap, "
                 "bounded_stale_partial_bootstrap, bounded_stale_minlen_bootstrap, "
                 "xy_full_minlen_bootstrap, or local_input_excitation_bootstrap"
             )
@@ -231,6 +232,7 @@ class DeePC:
         self.bootstrap_partial_excitation_scores_accepted = []
         self.bootstrap_partial_excitation_scores_rejected = []
         self.bootstrap_excitation_thresholds = []
+        self.bootstrap_slot_audit = []
         self.bank_mode = "dual_bank"
         self.bank_states = {
             "nominal": self._capture_bank_state(),
@@ -1290,6 +1292,7 @@ class DeePC:
             slot_is_partial = np.any(np.asarray(slot["mask"], dtype=float).reshape(self.p) < 0.5)
             if self.async_bootstrap_mode in {
                 "bootstrap_only_partial",
+                "bootstrap_only_partial_qp_guard",
                 "recent_consistent_partial_bootstrap",
                 "bounded_stale_partial_bootstrap",
                 "bounded_stale_minlen_bootstrap",
@@ -1300,6 +1303,7 @@ class DeePC:
                     self._append_training_pair(slot)
                     self._append_bootstrap_training_pair(slot, is_partial=False)
                 else:
+                    bootstrap_len_before = len(self.bootstrap_u_d) if isinstance(self.bootstrap_u_d, list) else int(self.bootstrap_u_d.shape[1])
                     accept_partial, score = self._bootstrap_partial_acceptance(slot)
                     if score is not None:
                         if accept_partial:
@@ -1308,6 +1312,15 @@ class DeePC:
                             self.bootstrap_partial_excitation_scores_rejected.append(float(score))
                     if accept_partial:
                         self._append_bootstrap_training_pair(slot, is_partial=True)
+                    bootstrap_len_after = len(self.bootstrap_u_d) if isinstance(self.bootstrap_u_d, list) else int(self.bootstrap_u_d.shape[1])
+                    self._record_bootstrap_slot_audit(
+                        slot,
+                        accepted=accept_partial,
+                        reason=self._bootstrap_partial_reason(slot, accept_partial, score),
+                        bootstrap_len_before=bootstrap_len_before,
+                        bootstrap_len_after=bootstrap_len_after,
+                        excitation_score=score,
+                    )
             else:
                 if not self._async_slot_is_bootstrap_eligible(slot):
                     self.next_async_training_source_step += 1
@@ -1326,6 +1339,7 @@ class DeePC:
             return self._async_slot_matches_partial_bootstrap_rule(slot)
         if self.async_bootstrap_mode in {
             "bootstrap_only_partial",
+            "bootstrap_only_partial_qp_guard",
             "recent_consistent_partial_bootstrap",
             "bounded_stale_partial_bootstrap",
             "bounded_stale_minlen_bootstrap",
@@ -1395,6 +1409,8 @@ class DeePC:
     def _async_slot_matches_bootstrap_partial_rule(self, slot):
         if self.async_bootstrap_mode == "bootstrap_only_partial":
             return self._async_slot_matches_partial_bootstrap_rule(slot)
+        if self.async_bootstrap_mode == "bootstrap_only_partial_qp_guard":
+            return self._async_slot_matches_partial_bootstrap_rule(slot)
         if self.async_bootstrap_mode == "recent_consistent_partial_bootstrap":
             return self._async_slot_matches_recent_consistent_partial_rule(slot)
         if self.async_bootstrap_mode in {"bounded_stale_partial_bootstrap", "bounded_stale_minlen_bootstrap"}:
@@ -1406,6 +1422,11 @@ class DeePC:
         raise ValueError(f"Unsupported bootstrap partial rule for mode: {self.async_bootstrap_mode}")
 
     def _bootstrap_partial_acceptance(self, slot):
+        if self.async_bootstrap_mode == "bootstrap_only_partial_qp_guard":
+            base_accept = self._async_slot_matches_partial_bootstrap_rule(slot)
+            if not base_accept:
+                return False, None
+            return self._bootstrap_only_partial_qp_guard_acceptance(slot)
         if self.async_bootstrap_mode == "local_input_excitation_bootstrap":
             score = self._local_input_excitation_score(int(slot["source_step"]))
             threshold = self._local_input_excitation_threshold()
@@ -1416,6 +1437,38 @@ class DeePC:
                 score,
             )
         return self._async_slot_matches_bootstrap_partial_rule(slot), None
+
+    def _bootstrap_partial_reason(self, slot, accepted, score):
+        mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+        observed = mask > 0.5
+        observed_dim_count = int(np.sum(observed))
+        position_observed = int(np.sum(observed[self.position_output_rows])) if self.position_output_rows else 0
+        if self.async_bootstrap_mode == "bootstrap_only_partial":
+            if accepted:
+                return "obs_ge4_pos_ge2"
+            if observed_dim_count < 4:
+                return "reject_obs_lt4"
+            if position_observed < 2:
+                return "reject_pos_obs_lt2"
+            return "reject_other"
+        if self.async_bootstrap_mode == "bootstrap_only_partial_qp_guard":
+            if accepted:
+                return "obs_ge4_pos_ge2_guard_pass"
+            if observed_dim_count < 4:
+                return "reject_obs_lt4"
+            if position_observed < 2:
+                return "reject_pos_obs_lt2"
+            if self._bootstrap_remaining_slots_to_target() <= 2:
+                return "reject_qp_guard_final_window"
+            return "reject_qp_guard_other"
+        if self.async_bootstrap_mode == "local_input_excitation_bootstrap":
+            if score is None:
+                return "reject_missing_excitation_score"
+            threshold = self.bootstrap_excitation_thresholds[-1] if self.bootstrap_excitation_thresholds else None
+            if threshold is None:
+                return "reject_missing_excitation_threshold"
+            return "excitation_ge_threshold" if accepted else "excitation_lt_threshold"
+        return "accepted_rule_match" if accepted else "rejected_rule_mismatch"
 
     def _local_input_excitation_score(self, source_step, window=5):
         start_step = max(int(source_step) - int(window) + 1, 0)
@@ -1429,6 +1482,47 @@ class DeePC:
         input_array = np.asarray(inputs, dtype=float)
         deltas = np.diff(input_array, axis=0)
         return float(np.sqrt(np.mean(np.sum(np.square(deltas), axis=1))))
+
+    def _local_input_window_stats(self, source_step, window=5):
+        start_step = max(int(source_step) - int(window) + 1, 0)
+        inputs = []
+        for step in range(start_step, int(source_step) + 1):
+            if step not in self.applied_inputs_by_step:
+                return {
+                    "window_length": int(len(inputs)),
+                    "delta_u_rms": None,
+                    "delta_u_energy": None,
+                    "local_input_rank": None,
+                    "local_input_cond": None,
+                }
+            inputs.append(np.asarray(self.applied_inputs_by_step[step], dtype=float).reshape(self.m))
+        if len(inputs) < 2:
+            return {
+                "window_length": int(len(inputs)),
+                "delta_u_rms": None,
+                "delta_u_energy": None,
+                "local_input_rank": None,
+                "local_input_cond": None,
+            }
+        input_array = np.asarray(inputs, dtype=float)
+        deltas = np.diff(input_array, axis=0)
+        rms = float(np.sqrt(np.mean(np.sum(np.square(deltas), axis=1))))
+        energy = float(np.sum(np.square(deltas)))
+        if deltas.size == 0:
+            rank = 0
+            cond = None
+        else:
+            singular_values = np.linalg.svd(deltas, compute_uv=False)
+            rank = int(np.linalg.matrix_rank(deltas))
+            positive = singular_values[singular_values > 1.0e-9]
+            cond = None if positive.size < 2 else float(positive.max() / positive.min())
+        return {
+            "window_length": int(len(inputs)),
+            "delta_u_rms": rms,
+            "delta_u_energy": energy,
+            "local_input_rank": rank,
+            "local_input_cond": cond,
+        }
 
     def _local_input_excitation_threshold(self):
         scores = []
@@ -1445,12 +1539,103 @@ class DeePC:
             return None
         return float(np.percentile(np.asarray(scores, dtype=float), self.local_input_excitation_quantile))
 
+    def _bootstrap_only_partial_qp_guard_acceptance(self, slot):
+        remaining_slots = self._bootstrap_remaining_slots_to_target()
+        if remaining_slots > 2:
+            return True, None
+        dynamic_stats = self._local_input_window_stats(int(slot["source_step"]))
+        delta_u_rms = dynamic_stats["delta_u_rms"]
+        local_input_cond = dynamic_stats["local_input_cond"]
+        if delta_u_rms is None or local_input_cond is None:
+            return False, None
+        thresholds = self._bootstrap_full_slot_dynamic_thresholds()
+        if thresholds is None:
+            return False, None
+        rms_threshold = min(thresholds["delta_u_rms_median"] * 0.9, 0.23)
+        cond_threshold = min(thresholds["local_input_cond_median"] * 0.9, 10.0)
+        accept = bool(delta_u_rms <= rms_threshold and local_input_cond <= cond_threshold)
+        return accept, None
+
+    def _bootstrap_remaining_slots_to_target(self):
+        target = self._bootstrap_target_length()
+        current = len(self.bootstrap_u_d) if isinstance(self.bootstrap_u_d, list) else int(self.bootstrap_u_d.shape[1])
+        return int(max(target - current, 0))
+
+    def _bootstrap_full_slot_dynamic_thresholds(self):
+        rms_values = []
+        cond_values = []
+        for source_step, slot in sorted(self.async_source_slots.items()):
+            if source_step >= self.next_async_training_source_step:
+                break
+            mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+            if np.any(mask < 0.5):
+                continue
+            stats = self._local_input_window_stats(int(source_step))
+            if stats["delta_u_rms"] is not None:
+                rms_values.append(float(stats["delta_u_rms"]))
+            if stats["local_input_cond"] is not None and np.isfinite(stats["local_input_cond"]):
+                cond_values.append(float(stats["local_input_cond"]))
+        if not rms_values or not cond_values:
+            return None
+        return {
+            "delta_u_rms_median": float(np.median(np.asarray(rms_values, dtype=float))),
+            "local_input_cond_median": float(np.median(np.asarray(cond_values, dtype=float))),
+        }
+
+    def _record_bootstrap_slot_audit(
+        self,
+        slot,
+        accepted,
+        reason,
+        bootstrap_len_before,
+        bootstrap_len_after,
+        excitation_score,
+    ):
+        mask = np.asarray(slot["mask"], dtype=float).reshape(self.p)
+        observed = mask > 0.5
+        source_steps = np.asarray(slot["source_steps"], dtype=float).reshape(self.p)
+        missing_indices = [int(idx) for idx in np.where(~observed)[0].tolist()]
+        stale_missing = (
+            np.asarray(int(slot["source_step"]) - source_steps[~observed], dtype=float)
+            if np.any(~observed)
+            else np.asarray([], dtype=float)
+        )
+        position_rows = list(self.position_output_rows)
+        xy_rows = position_rows[:2]
+        dynamic_stats = self._local_input_window_stats(int(slot["source_step"]))
+        self.bootstrap_slot_audit.append(
+            {
+                "source_step": int(slot["source_step"]),
+                "delivered_step": int(slot["delivered_step"]),
+                "observed_dim_count": int(np.sum(observed)),
+                "missing_dim_indices": missing_indices,
+                "xy_observed": bool(np.all(observed[xy_rows])) if xy_rows else False,
+                "position_observed_count": int(np.sum(observed[position_rows])) if position_rows else 0,
+                "position_obs_ge2": bool(np.sum(observed[position_rows]) >= 2) if position_rows else False,
+                "mean_missing_stale": (
+                    None if stale_missing.size == 0 else float(np.mean(stale_missing))
+                ),
+                "max_missing_stale": (
+                    None if stale_missing.size == 0 else float(np.max(stale_missing))
+                ),
+                "accepted_into_bootstrap_bank": bool(accepted),
+                "decision_reason": str(reason),
+                "bootstrap_bank_len_before": int(bootstrap_len_before),
+                "bootstrap_bank_len_after": int(bootstrap_len_after),
+                "local_input_excitation_score": (
+                    None if excitation_score is None else float(excitation_score)
+                ),
+                **dynamic_stats,
+            }
+        )
+
     def _qp_path_available(self):
         return bool(self.data_is_persistently_exciting or self._bootstrap_qp_available())
 
     def _bootstrap_qp_available(self):
         return self.async_bootstrap_mode in {
             "bootstrap_only_partial",
+            "bootstrap_only_partial_qp_guard",
             "recent_consistent_partial_bootstrap",
             "bounded_stale_partial_bootstrap",
             "bounded_stale_minlen_bootstrap",
